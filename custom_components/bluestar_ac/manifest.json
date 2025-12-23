@@ -1,13 +1,13 @@
 {
-    "domain": "bluestar_ac",
-    "name": "Bluestar AC",
-    "documentation": "https://github.com/sankarhansdah/Bluestar-Smart-AC",
-    "dependencies": [],
-    "codeowners": ["@sankarhansdah"],
-    "requirements": [],
-    "version": "1.0.0",
-    "config_flow": true,
-    "iot_class": "cloud_polling",
-    "integration_type": "device"
+  "domain": "bluestar_ac",
+  "name": "Bluestar AC",
+  "documentation": "https://github.com/KakatkarAkshay/bluestar_hacs",
+  "dependencies": [],
+  "codeowners": ["@KakatkarAkshay"],
+  "requirements": [],
+  "version": "1.0.0",
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "integration_type": "device",
+  "logo": "https://www.bluestarindia.com/img/logo.png"
 }
-
