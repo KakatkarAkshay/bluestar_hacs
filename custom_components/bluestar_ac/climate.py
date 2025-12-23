@@ -95,7 +95,10 @@ class BluestarACClimate(CoordinatorEntity, ClimateEntity):
         # Set available modes (only Off and Cool)
         self._attr_hvac_modes = [
             HVACMode.OFF,
+            HVACMode.FAN_ONLY,
             HVACMode.COOL,
+            HVACMode.DRY,
+            HVACMode.AUTO,
         ]
         self._attr_fan_modes = ["auto", "low", "medium", "high", "turbo"]
         self._attr_swing_modes = ["off", "horizontal", "vertical", "both"]
@@ -170,14 +173,7 @@ class BluestarACClimate(CoordinatorEntity, ClimateEntity):
             if not power:
                 return HVACMode.OFF
             mode = state.get("mode", 2)
-            # Mode 1 doesn't exist on this AC, default to Cool if we see it
-            if mode == 1:
-                mode = 2
-            # Only support OFF and COOL - map all other modes (Fan, Dry, Auto) to COOL
-            ha_mode = BLUESTAR_TO_HA_MODE.get(mode, HVACMode.COOL)
-            if ha_mode not in [HVACMode.OFF, HVACMode.COOL]:
-                return HVACMode.COOL
-            return ha_mode
+            return BLUESTAR_TO_HA_MODE.get(mode, HVACMode.COOL)
         return HVACMode.OFF
     
     @property
@@ -245,12 +241,8 @@ class BluestarACClimate(CoordinatorEntity, ClimateEntity):
             if hvac_mode == HVACMode.OFF:
                 await self.coordinator.set_power(self._device_id, False)
             elif hvac_mode == HVACMode.COOL:
-                # Only support COOL mode (Bluestar mode 2)
-                await self.coordinator.control_device(self._device_id, {"pow": 1, "mode": 2})
-            else:
-                # If somehow an unsupported mode is requested, default to COOL
-                _LOGGER.warning(f"⚠️ Unsupported mode {hvac_mode} requested, defaulting to COOL")
-                await self.coordinator.control_device(self._device_id, {"pow": 1, "mode": 2})
+                bluestar_mode = HA_TO_BLUESTAR_MODE.get(hvac_mode, 2)
+                await self.coordinator.control_device(self._device_id, {"pow": 1, "mode": bluestar_mode})
         except Exception as e:
             _LOGGER.error(f"❌ set_hvac_mode failed: {e}", exc_info=True)
             raise
