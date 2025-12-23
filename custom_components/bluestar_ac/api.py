@@ -1,8 +1,13 @@
 """Bluestar Smart AC API client with MQTT support."""
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
+import time
+import urllib.parse
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -11,6 +16,7 @@ import aiohttp
 try:
     import paho.mqtt.client as mqtt_client
     import ssl
+    import requests
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
@@ -50,20 +56,28 @@ class BluestarCredentialExtractor:
             if not mi:
                 raise BluestarAPIError("No 'mi' field in login response")
             
-            # Decode Base64 and split by "::"
+            # Decode Base64 and split by "::" or ":"
             decoded = base64.b64decode(mi).decode('utf-8')
-            parts = decoded.split('::')
+            # Try both delimiters - some responses use '::' and others use ':'
+            if '::' in decoded:
+                parts = decoded.split('::')
+            else:
+                parts = decoded.split(':')
             
-            if len(parts) != 3:
-                raise BluestarAPIError(f"Invalid credential format. Expected 3 parts, got {len(parts)}")
+            if len(parts) < 3:
+                raise BluestarAPIError(f"Invalid credential format. Expected at least 3 parts, got {len(parts)}")
             
-            endpoint, access_key, secret_key = parts
+            endpoint = parts[0]
+            access_key = parts[1]
+            secret_key = parts[2]
+            aws_session_token = parts[3] if len(parts) > 3 else None
             
             self.credentials = {
                 "endpoint": endpoint,
                 "access_key": access_key,
                 "secret_key": secret_key,
                 "session_id": login_response.get("session"),
+                "session_token": aws_session_token,
                 "user_id": login_response.get("user", {}).get("id"),
                 "raw": mi
             }
@@ -72,7 +86,7 @@ class BluestarCredentialExtractor:
             _LOGGER.info(f"📍 Endpoint: {endpoint}")
             _LOGGER.info(f"🔑 Access Key: {access_key[:8]}...")
             _LOGGER.info(f"🔐 Secret Key: {secret_key[:8]}...")
-            _LOGGER.info(f"🆔 Session ID: {login_response.get('session')}")
+            _LOGGER.info(f"🔑 AWS Session Token: {'present' if aws_session_token else 'none'}")
             
             return self.credentials
             
@@ -93,6 +107,73 @@ class BluestarCredentialExtractor:
                 self.credentials.get("session_id"))
 
 
+class AWSSigV4:
+    """AWS SigV4 signing for WebSocket MQTT connection."""
+    
+    @staticmethod
+    def sign(key: bytes, msg: str) -> bytes:
+        """Create HMAC-SHA256 signature."""
+        return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+    
+    @staticmethod
+    def get_signature_key(key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
+        """Generate signing key for AWS SigV4."""
+        k_date = AWSSigV4.sign(('AWS4' + key).encode('utf-8'), date_stamp)
+        k_region = AWSSigV4.sign(k_date, region_name)
+        k_service = AWSSigV4.sign(k_region, service_name)
+        k_signing = AWSSigV4.sign(k_service, 'aws4_request')
+        return k_signing
+    
+    @staticmethod
+    def create_websocket_url(endpoint: str, region: str, access_key: str, secret_key: str, session_token: Optional[str] = None) -> str:
+        """Create AWS IoT WebSocket URL with SigV4 authentication."""
+        # Parse endpoint to get host
+        if '://' in endpoint:
+            host = endpoint.split('://')[1].split('/')[0]
+        else:
+            host = endpoint.split('/')[0]
+        
+        # Get current time
+        now = datetime.utcnow()
+        amz_date = now.strftime('%Y%m%dT%H%M%SZ')
+        date_stamp = now.strftime('%Y%m%d')
+        
+        # Service and region
+        service = 'iotdevicegateway'
+        
+        # Create canonical request
+        canonical_uri = '/mqtt'
+        canonical_querystring = f'X-Amz-Algorithm=AWS4-HMAC-SHA256'
+        canonical_querystring += f'&X-Amz-Credential={urllib.parse.quote_plus(f"{access_key}/{date_stamp}/{region}/{service}/aws4_request")}'
+        canonical_querystring += f'&X-Amz-Date={amz_date}'
+        canonical_querystring += f'&X-Amz-SignedHeaders=host'
+        
+        if session_token:
+            canonical_querystring += f'&X-Amz-Security-Token={urllib.parse.quote_plus(session_token)}'
+        
+        canonical_headers = f'host:{host}\n'
+        signed_headers = 'host'
+        payload_hash = hashlib.sha256(''.encode('utf-8')).hexdigest()
+        
+        canonical_request = f'GET\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+        
+        # Create string to sign
+        algorithm = 'AWS4-HMAC-SHA256'
+        credential_scope = f'{date_stamp}/{region}/{service}/aws4_request'
+        string_to_sign = f'{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+        
+        # Calculate signature
+        signing_key = AWSSigV4.get_signature_key(secret_key, date_stamp, region, service)
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+        
+        # Add signature to query string
+        canonical_querystring += f'&X-Amz-Signature={signature}'
+        
+        # Create WebSocket URL
+        url = f'wss://{host}{canonical_uri}?{canonical_querystring}'
+        return url
+
+
 class BluestarMQTTClient:
     """MQTT client for Bluestar Smart AC control."""
     
@@ -104,53 +185,113 @@ class BluestarMQTTClient:
         self.client = None
         self.is_connected = False
         self.client_id = f"u-{credentials['session_id']}"
+        self.message_callback = None  # Callback for handling MQTT messages
+        self.subscribed_devices = set()  # Track subscribed device IDs
         
-        # EXACT CONSTANTS FROM DECOMPILED APP
+        # Extract region from endpoint (e.g., a26381dl7mudo4-ats.iot.ap-south-1.amazonaws.com -> ap-south-1)
+        endpoint = credentials.get("endpoint", "")
+        if ".iot." in endpoint:
+            # Extract region from endpoint
+            parts = endpoint.split(".iot.")
+            if len(parts) > 1:
+                region_part = parts[1].split(".amazonaws.com")[0]
+                # Extract region (e.g., ap-south-1 from ap-south-1.amazonaws.com)
+                if "." in region_part:
+                    self.region = region_part.split(".")[0]
+                else:
+                    self.region = region_part
+            else:
+                self.region = "ap-south-1"
+        else:
+            self.region = "ap-south-1"
+        
         self.FORCE_FETCH_KEY_NAME = "fpsh"
         self.PUB_CONTROL_TOPIC_NAME = "things/%s/control"
         self.PUB_STATE_UPDATE_TOPIC_NAME = "$aws/things/%s/shadow/update"
+        self.SUB_STATE_REPORTED_TOPIC_NAME = "things/%s/state/reported"
         self.SRC_KEY = "src"
         self.SRC_VALUE = "anmq"
         
         _LOGGER.info("🔧 Bluestar MQTT Client created")
+        _LOGGER.info(f"📍 Endpoint: {endpoint}")
+        _LOGGER.info(f"🌍 Region: {self.region}")
     
     async def connect(self) -> bool:
-        """Connect to MQTT broker."""
+        """Connect to MQTT broker using AWS IoT WebSocket with SigV4."""
         try:
-            self.client = mqtt_client.Client(client_id=self.client_id, callback_api_version=mqtt_client.CallbackAPIVersion.VERSION1)
+            endpoint = self.credentials["endpoint"]
+            access_key = self.credentials["access_key"]
+            secret_key = self.credentials["secret_key"]
+            session_token = self.credentials.get("session_token")  # May not be present
             
-            # Configure SSL/TLS - use thread-safe approach
-            import asyncio
+            # Create WebSocket URL with SigV4 authentication
+            websocket_url = AWSSigV4.create_websocket_url(
+                endpoint=endpoint,
+                region=self.region,
+                access_key=access_key,
+                secret_key=secret_key,
+                session_token=session_token
+            )
+            
+            _LOGGER.info(f"🔌 Connecting to MQTT broker via WebSocket: {endpoint}")
+            _LOGGER.debug(f"WebSocket URL: {websocket_url[:100]}...")  # Don't log full URL with credentials
+            
+            # Parse WebSocket URL to get host and port
+            parsed = urllib.parse.urlparse(websocket_url)
+            host = parsed.hostname
+            port = parsed.port or 443
+            
+            # Create MQTT client with WebSocket transport
+            self.client = mqtt_client.Client(
+                client_id=self.client_id,
+                transport="websockets",
+                callback_api_version=mqtt_client.CallbackAPIVersion.VERSION1
+            )
+            
+            # Configure WebSocket options with the full URL path and query string
+            # paho-mqtt expects the path and query to be set separately
+            path_with_query = parsed.path
+            if parsed.query:
+                path_with_query += "?" + parsed.query
+            
+            self.client.ws_set_options(
+                path=path_with_query,
+                headers=None
+            )
+            
+            # Configure SSL/TLS - run in executor to avoid blocking event loop
             loop = asyncio.get_event_loop()
             context = await loop.run_in_executor(None, ssl.create_default_context)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            
             self.client.tls_set_context(context)
             
             # Set up event handlers
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
             self.client.on_error = self._on_error
+            self.client.on_message = self._on_message
             
-            # Connect to broker
-            endpoint = self.credentials["endpoint"]
-            _LOGGER.info(f"🔌 Connecting to MQTT broker: {endpoint}")
+            # Connect to broker - run in executor to avoid blocking
+            _LOGGER.info(f"🔌 Connecting to {host}:{port} with client_id: {self.client_id}")
+            _LOGGER.debug(f"WebSocket path: {path_with_query[:200]}...")  # Log partial path
             
-            self.client.connect(endpoint, 443, 10)  # Reduced keepalive to 10 seconds
+            # Run connect in executor since it's a blocking call
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.client.connect, host, port, 60)
             self.client.loop_start()
             
-            # Wait for connection with shorter timeout
-            timeout = 10  # Reduced from 30 to 10 seconds
+            # Wait for connection
+            timeout = 10  # Reduced timeout
             while not self.is_connected and timeout > 0:
-                await asyncio.sleep(0.5)  # Check more frequently
+                await asyncio.sleep(0.5)
                 timeout -= 0.5
             
             if self.is_connected:
-                _LOGGER.info("✅ MQTT Connected successfully")
+                _LOGGER.info("✅ MQTT Connected successfully via WebSocket")
                 return True
             else:
-                _LOGGER.warning("⚠️ MQTT connection timeout - continuing with HTTP API only")
+                _LOGGER.info("ℹ️ MQTT connection timeout - will use HTTP API (this is fine)")
                 # Clean up failed connection
                 try:
                     self.client.loop_stop()
@@ -160,7 +301,14 @@ class BluestarMQTTClient:
                 return False
                 
         except Exception as error:
-            _LOGGER.error(f"❌ Failed to connect to MQTT: {error}")
+            _LOGGER.info(f"ℹ️ MQTT connection failed (will use HTTP API): {error}")
+            # Don't log full traceback for MQTT failures - it's expected to fail sometimes
+            try:
+                if self.client:
+                    self.client.loop_stop()
+                    self.client.disconnect()
+            except:
+                pass
             return False
     
     def _on_connect(self, client, userdata, flags, rc):
@@ -182,6 +330,51 @@ class BluestarMQTTClient:
         _LOGGER.error(f"❌ MQTT Error: {error}")
         self.is_connected = False
     
+    def _on_message(self, client, userdata, msg):
+        """Handle MQTT messages."""
+        try:
+            import json
+            payload = json.loads(msg.payload.decode())
+            
+            # Check if this is a device state report
+            if "state/reported" in msg.topic:
+                # Extract device ID from topic: things/{device_id}/state/reported
+                parts = msg.topic.split("/")
+                if len(parts) >= 2:
+                    device_id = parts[1]
+                    
+                    # Call the message callback if set
+                    if self.message_callback:
+                        self.message_callback(device_id, payload)
+                    else:
+                        _LOGGER.debug(f"📥 MQTT state report for {device_id}: {json.dumps(payload, indent=2)[:200]}")
+        except Exception as error:
+            _LOGGER.warning(f"⚠️ Error processing MQTT message: {error}")
+    
+    def set_message_callback(self, callback):
+        """Set callback for handling MQTT messages."""
+        self.message_callback = callback
+    
+    def subscribe_to_device(self, device_id: str) -> bool:
+        """Subscribe to device state reports."""
+        if not self.is_connected or not self.client:
+            _LOGGER.warning(f"⚠️ Cannot subscribe to {device_id}: MQTT not connected")
+            return False
+        
+        try:
+            topic = self.SUB_STATE_REPORTED_TOPIC_NAME % device_id
+            result = self.client.subscribe(topic, qos=0)
+            if result[0] == mqtt_client.MQTT_ERR_SUCCESS:
+                self.subscribed_devices.add(device_id)
+                _LOGGER.info(f"✅ Subscribed to MQTT topic: {topic}")
+                return True
+            else:
+                _LOGGER.warning(f"⚠️ Failed to subscribe to {topic}: {result[0]}")
+                return False
+        except Exception as error:
+            _LOGGER.warning(f"⚠️ Error subscribing to {device_id}: {error}")
+            return False
+    
     def publish(self, device_id: str, control_payload: Dict[str, Any]) -> bool:
         """Publish control command via MQTT."""
         if not self.is_connected:
@@ -189,30 +382,38 @@ class BluestarMQTTClient:
             return False
         
         try:
-            # Step 1: Add src key (EXACT from decompiled app)
-            control_payload[self.SRC_KEY] = self.SRC_VALUE
+            formatted_payload = {}
+            for key, value in control_payload.items():
+                if key == "stemp":
+                    if isinstance(value, (int, float)):
+                        formatted_payload[key] = f"{float(value):.1f}"
+                    else:
+                        formatted_payload[key] = str(value)
+                elif key in ["pow", "mode", "fspd", "vswing", "hswing", "display"]:
+                    formatted_payload[key] = int(value)
+                else:
+                    formatted_payload[key] = value
             
-            # Step 2: Create desired object
-            desired_object = control_payload.copy()
+            formatted_payload[self.SRC_KEY] = self.SRC_VALUE
             
-            # Step 3: Create state object
+            if "ts" not in formatted_payload:
+                formatted_payload["ts"] = int(time.time() * 1000)
+            
             state_object = {
                 "state": {
-                    "desired": desired_object
+                    "desired": formatted_payload.copy()
                 }
             }
             
-            # Step 4: Format topic
             topic = self.PUB_STATE_UPDATE_TOPIC_NAME % device_id
             
-            _LOGGER.info(f"📤 MQTT Publish: {json.dumps(state_object, indent=2)}")
-            _LOGGER.info(f"📤 Topic: {topic}")
+            _LOGGER.warning(f"📤 MQTT Publish: {json.dumps(state_object, indent=2)}")
+            _LOGGER.warning(f"📤 Topic: {topic}")
             
-            # Step 5: Publish with QOS0
             result = self.client.publish(topic, json.dumps(state_object), qos=0)
             
             if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
-                _LOGGER.info("✅ Successfully published via MQTT")
+                _LOGGER.warning("✅ Successfully published via MQTT")
                 return True
             else:
                 _LOGGER.error(f"❌ Failed to publish via MQTT: {result.rc}")
@@ -395,7 +596,7 @@ class BluestarAPI:
     async def _initialize_mqtt_client(self, login_data: Dict[str, Any]) -> bool:
         """Initialize MQTT client with credentials from login response."""
         if not MQTT_AVAILABLE:
-            _LOGGER.warning("⚠️ MQTT not available - using HTTP-only mode")
+            _LOGGER.info("ℹ️ MQTT not available - using HTTP-only mode (this is fine)")
             return False
             
         try:
@@ -409,19 +610,32 @@ class BluestarAPI:
             # Create new MQTT client
             self.mqtt_client = BluestarMQTTClient(credentials)
             
-            # Connect to MQTT
-            success = await self.mqtt_client.connect()
-            
-            if success:
-                _LOGGER.info("✅ MQTT client initialized and connected")
-                return True
-            else:
-                _LOGGER.warning("⚠️ MQTT client failed to connect")
+            # Try to connect to MQTT (non-blocking, don't fail if it doesn't work)
+            try:
+                success = await self.mqtt_client.connect()
+                if success:
+                    _LOGGER.info("✅ MQTT client initialized and connected")
+                    # Subscribe to all known devices after connection
+                    # This will be called after devices are fetched
+                    return True
+                else:
+                    _LOGGER.info("ℹ️ MQTT client failed to connect - will use HTTP API (this is fine)")
+                    return False
+            except Exception as connect_error:
+                _LOGGER.info(f"ℹ️ MQTT connection error (will use HTTP API): {connect_error}")
                 return False
                 
         except Exception as error:
-            _LOGGER.error(f"❌ Failed to initialize MQTT client: {error}")
+            _LOGGER.info(f"ℹ️ MQTT initialization skipped (will use HTTP API): {error}")
             return False
+
+    def subscribe_to_devices(self, device_ids: List[str]) -> None:
+        """Subscribe to MQTT state reports for given devices."""
+        if not self.mqtt_client or not self.mqtt_client.is_connected:
+            return
+        
+        for device_id in device_ids:
+            self.mqtt_client.subscribe_to_device(device_id)
 
     async def get_devices(self) -> Dict[str, Any]:
         """Get list of devices."""
@@ -460,173 +674,205 @@ class BluestarAPI:
 
     async def control_device(self, device_id: str, control_data: Dict[str, Any]) -> Dict[str, Any]:
         """Control device using EXACT BLUESTAR CONTROL ALGORITHM."""
+        _LOGGER.warning("=" * 80)
+        _LOGGER.warning(f"🎛️ API.control_device CALLED - device_id: {device_id}")
+        _LOGGER.warning(f"🎛️ Control data: {json.dumps(control_data, indent=2)}")
+        _LOGGER.warning(f"🎛️ Session token present: {self.session_token is not None}")
+        
         if not self.session_token:
+            _LOGGER.error("❌ Not authenticated. Call login() first.")
             raise BluestarAPIError("Not authenticated. Call login() first.")
 
-        _LOGGER.info(f"🎛️ Control request for device: {device_id}")
-        _LOGGER.info(f"Control data: {json.dumps(control_data, indent=2)}")
-
         headers = self._get_auth_headers()
-
-        # EXACT BLUESTAR CONTROL ALGORITHM - DIRECT JSON STRUCTURE
-        # Build the exact payload structure as used by the original app
         control_payload = {}
         
-        # Add all control parameters directly (NOT nested under mode!)
         if control_data.get("pow") is not None:
-            control_payload["pow"] = control_data["pow"]
+            control_payload["pow"] = int(control_data["pow"])
         if control_data.get("mode") is not None:
-            # EXACT MODE STRUCTURE from decompiled app
-            control_payload["mode"] = {
-                "value": int(control_data["mode"])
-            }
+            control_payload["mode"] = int(control_data["mode"])
         if control_data.get("stemp") is not None:
-            control_payload["stemp"] = control_data["stemp"]
+            stemp_value = control_data["stemp"]
+            if isinstance(stemp_value, (int, float)):
+                control_payload["stemp"] = f"{float(stemp_value):.1f}"
+            else:
+                control_payload["stemp"] = str(stemp_value)
         if control_data.get("fspd") is not None:
-            control_payload["fspd"] = control_data["fspd"]
+            control_payload["fspd"] = int(control_data["fspd"])
         if control_data.get("vswing") is not None:
-            control_payload["vswing"] = control_data["vswing"]
+            control_payload["vswing"] = int(control_data["vswing"])
         if control_data.get("hswing") is not None:
-            control_payload["hswing"] = control_data["hswing"]
+            control_payload["hswing"] = int(control_data["hswing"])
         if control_data.get("display") is not None:
-            control_payload["display"] = control_data["display"]
+            control_payload["display"] = int(control_data["display"])
+        if control_data.get("esave") is not None:
+            control_payload["esave"] = int(control_data["esave"])
+        if control_data.get("turbo") is not None:
+            control_payload["turbo"] = int(control_data["turbo"])
+        if control_data.get("sleep") is not None:
+            control_payload["sleep"] = int(control_data["sleep"])
 
-        # Add timestamp and source (EXACT APK FORMAT)
-        control_payload["ts"] = int(asyncio.get_event_loop().time() * 1000)
+        control_payload["ts"] = int(time.time() * 1000)
         control_payload["src"] = "anmq"
 
-        _LOGGER.info(f"📤 Step 1: Sending direct control via MQTT: {json.dumps(control_payload, indent=2)}")
-
-        # EXACT BLUESTAR CONTROL ALGORITHM - MQTT PRIMARY METHOD
         control_result = None
+        mqtt_available = MQTT_AVAILABLE and self.mqtt_client and self.mqtt_client.is_connected
+        _LOGGER.warning(f"🔍 MQTT status: MQTT_AVAILABLE={MQTT_AVAILABLE}, has_client={self.mqtt_client is not None}, is_connected={self.mqtt_client.is_connected if self.mqtt_client else False}")
         
-        # Step 1: Try EXACT MQTT control (PRIMARY METHOD from decompiled app)
-        if MQTT_AVAILABLE and self.mqtt_client and self.mqtt_client.is_connected:
+        if mqtt_available:
             try:
-                _LOGGER.info(f"📤 Step 1: Sending EXACT MQTT control: {json.dumps(control_payload, indent=2)}")
-                
-                # Use EXACT publish method from decompiled app
+                _LOGGER.warning(f"📤 Sending MQTT shadow update: {json.dumps(control_payload, indent=2)}")
                 success = self.mqtt_client.publish(device_id, control_payload)
                 
                 if success:
-                    control_result = {"method": "EXACT_MQTT", "status": "success"}
-                    _LOGGER.info("✅ EXACT MQTT control success")
+                    control_result = {"method": "MQTT", "status": "success"}
+                    _LOGGER.warning("✅ MQTT shadow update published successfully")
                 else:
-                    _LOGGER.warning("⚠️ EXACT MQTT control failed")
+                    _LOGGER.warning("⚠️ MQTT shadow update failed")
             except Exception as error:
-                _LOGGER.warning(f"⚠️ EXACT MQTT control failed: {error}")
+                _LOGGER.warning(f"⚠️ MQTT control failed: {error}")
         else:
             if not MQTT_AVAILABLE:
-                _LOGGER.info("⚠️ MQTT not available, using HTTP API only")
+                _LOGGER.warning("⚠️ MQTT not available, using HTTP API fallback")
+            elif not self.mqtt_client:
+                _LOGGER.warning("⚠️ MQTT client not initialized, using HTTP API fallback")
             else:
-                _LOGGER.warning("⚠️ EXACT MQTT client not available, trying HTTP API fallback")
+                _LOGGER.warning("⚠️ MQTT client not connected, using HTTP API fallback")
 
         # Step 2: HTTP API fallback with EXACT MODE CONTROL MECHANISM
+        # ONLY try HTTP if MQTT didn't succeed
         if not control_result:
+            _LOGGER.warning("=" * 80)
+            _LOGGER.warning("📤 HTTP API fallback (MQTT not available or failed)")
+            _LOGGER.warning(f"📤 Control payload: {json.dumps(control_payload, indent=2)}")
             try:
-                _LOGGER.info(f"📤 Step 2: Sending control via HTTP API (EXACT MODE CONTROL): {json.dumps(control_payload, indent=2)}")
+                devices_url = f"{self.base_url}{DEVICES_ENDPOINT}"
+                _LOGGER.warning(f"📤 Fetching device state from: {devices_url}")
                 
-                # EXACT MODE CONTROL MECHANISM from decompiled app
-                # Get current device state to determine the mode
-                device_response = await self.session.get(f"{self.base_url}{DEVICES_ENDPOINT}", headers=headers)
+                device_response = await self.session.get(devices_url, headers=headers)
+                _LOGGER.warning(f"📥 Device state response status: {device_response.status}")
                 
                 if not device_response.ok:
-                    raise BluestarAPIError("Failed to fetch device state")
+                    response_text = await device_response.text()
+                    raise BluestarAPIError(f"Failed to fetch device state: {device_response.status} - {response_text}")
                 
                 device_data = await device_response.json()
                 current_state = device_data.get("states", {}).get(device_id)
                 
                 if not current_state:
-                    raise BluestarAPIError("Device not found")
+                    raise BluestarAPIError(f"Device {device_id} not found in account")
 
-                # Determine current mode (EXACT from decompiled app)
                 current_mode = current_state.get("state", {}).get("mode", 2)
                 
-                # If mode is being changed, use the new mode (EXACT from decompiled app)
                 if control_payload.get("mode") is not None:
-                    # Handle both old format (direct value) and new format (nested with value)
                     if isinstance(control_payload["mode"], dict) and "value" in control_payload["mode"]:
                         current_mode = int(control_payload["mode"]["value"])
                     else:
                         current_mode = int(control_payload["mode"])
+                elif control_payload.get("pow") == 1 and current_mode is None:
+                    current_mode = 2
 
-                # Build mode-specific preferences structure (EXACT from decompiled app)
-                mode_config = {}
+                preferences_dict = {}
                 
-                # Add control parameters to mode configuration (EXACT from decompiled app)
                 if control_payload.get("pow") is not None:
-                    mode_config["power"] = str(control_payload["pow"])
+                    preferences_dict["pow"] = str(control_payload["pow"])
                 if control_payload.get("mode") is not None:
-                    # Handle both old format (direct value) and new format (nested with value)
                     if isinstance(control_payload["mode"], dict) and "value" in control_payload["mode"]:
-                        mode_config["mode"] = str(control_payload["mode"]["value"])
+                        preferences_dict["mode"] = str(control_payload["mode"]["value"])
                     else:
-                        mode_config["mode"] = str(control_payload["mode"])
+                        preferences_dict["mode"] = str(control_payload["mode"])
                 if control_payload.get("stemp") is not None:
-                    mode_config["stemp"] = str(control_payload["stemp"])
+                    preferences_dict["stemp"] = str(control_payload["stemp"])
                 if control_payload.get("fspd") is not None:
-                    mode_config["fspd"] = str(control_payload["fspd"])
+                    preferences_dict["fspd"] = str(control_payload["fspd"])
                 if control_payload.get("vswing") is not None:
-                    mode_config["vswing"] = str(control_payload["vswing"])
+                    preferences_dict["vswing"] = str(control_payload["vswing"])
                 if control_payload.get("hswing") is not None:
-                    mode_config["hswing"] = str(control_payload["hswing"])
+                    preferences_dict["hswing"] = str(control_payload["hswing"])
                 if control_payload.get("display") is not None:
-                    mode_config["display"] = str(control_payload["display"])
+                    preferences_dict["display"] = str(control_payload["display"])
+                if control_payload.get("esave") is not None:
+                    preferences_dict["esave"] = str(control_payload["esave"])
+                if control_payload.get("turbo") is not None:
+                    preferences_dict["turbo"] = str(control_payload["turbo"])
+                if control_payload.get("sleep") is not None:
+                    preferences_dict["sleep"] = str(control_payload["sleep"])
+                if control_payload.get("ts") is not None:
+                    preferences_dict["ts"] = str(control_payload["ts"])
 
-                # EXACT NESTED STRUCTURE from decompiled app
-                preferences_payload = {
-                    "preferences": {
-                        "mode": {
-                            str(current_mode): mode_config
-                        }
-                    }
-                }
+                preferences_payload = {"preferences": preferences_dict}
 
-                _LOGGER.info(f"📤 EXACT MODE CONTROL STRUCTURE: {json.dumps(preferences_payload, indent=2)}")
+                preferences_url = f"{self.base_url}{PREFERENCES_ENDPOINT.format(device_id=device_id)}"
+                _LOGGER.warning(f"📤 POSTing to: {preferences_url}")
 
-                preferences_response = await self.session.post(
-                    f"{self.base_url}{PREFERENCES_ENDPOINT.format(device_id=device_id)}",
-                    headers=headers,
-                    json=preferences_payload
-                )
-
-                if preferences_response.ok:
-                    control_result = await preferences_response.json()
-                    _LOGGER.info(f"✅ EXACT MODE CONTROL success: {control_result}")
-                else:
-                    _LOGGER.warning("⚠️ EXACT MODE CONTROL failed, trying direct MQTT structure")
-                    
-                    # Fallback to direct MQTT structure
-                    mqtt_style_payload = {
-                        "state": {
-                            "desired": control_payload
-                        }
-                    }
-                    
-                    state_response = await self.session.post(
-                        f"{self.base_url}{STATE_ENDPOINT.format(device_id=device_id)}",
+                try:
+                    preferences_response = await self.session.post(
+                        preferences_url,
                         headers=headers,
-                        json=mqtt_style_payload
+                        json=preferences_payload,
+                        timeout=aiohttp.ClientTimeout(total=30)
                     )
 
-                    if state_response.ok:
-                        control_result = await state_response.json()
-                        _LOGGER.info(f"✅ Direct MQTT structure success: {control_result}")
+                    _LOGGER.warning(f"📥 Response status: {preferences_response.status}")
+                    response_text = await preferences_response.text()
+                    _LOGGER.warning(f"📥 Response: {response_text[:500]}")
+                    
+                    if preferences_response.ok:
+                        try:
+                            api_response = json.loads(response_text)
+                            _LOGGER.warning(f"✅ HTTP control success: {api_response.get('code')}")
+                            control_result = {
+                                "method": "HTTP_PREFERENCES",
+                                "status": "success",
+                                "code": api_response.get("code", "UNKNOWN"),
+                                "message": api_response.get("message", ""),
+                                "response": api_response
+                            }
+                        except json.JSONDecodeError:
+                            _LOGGER.warning(f"✅ HTTP control success (non-JSON)")
+                            control_result = {"method": "HTTP_PREFERENCES", "status": "success", "response": response_text}
                     else:
-                        _LOGGER.warning("⚠️ All control methods failed")
-            except Exception as error:
-                _LOGGER.warning(f"⚠️ EXACT MODE CONTROL failed: {error}")
+                        _LOGGER.warning(f"⚠️ HTTP control failed: {preferences_response.status}")
+                except Exception as post_error:
+                    _LOGGER.error(f"❌ Error posting to preferences: {post_error}", exc_info=True)
+                    _LOGGER.warning("📤 Trying state endpoint fallback")
+                    
+                    try:
+                        mqtt_style_payload = {"state": {"desired": control_payload}}
+                        _LOGGER.warning(f"📤 Fallback to state endpoint")
+                        state_response = await self.session.post(
+                            f"{self.base_url}{STATE_ENDPOINT.format(device_id=device_id)}",
+                            headers=headers,
+                            json=mqtt_style_payload,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        )
 
-        # Step 3: Force sync if all methods fail
+                        _LOGGER.warning(f"📥 Fallback response: {state_response.status}")
+                        if state_response.ok:
+                            api_response = await state_response.json()
+                            _LOGGER.warning("✅ State endpoint success")
+                            control_result = {
+                                "method": "HTTP_STATE",
+                                "status": "success",
+                                "response": api_response
+                            }
+                        else:
+                            response_text = await state_response.text()
+                            _LOGGER.warning(f"⚠️ State endpoint failed: {state_response.status}")
+                    except Exception as fallback_error:
+                        _LOGGER.error(f"❌ Fallback failed: {fallback_error}", exc_info=True)
+            except Exception as error:
+                _LOGGER.error(f"❌ HTTP control failed: {error}", exc_info=True)
+
         if not control_result:
             try:
-                _LOGGER.info("📤 Step 3: Sending force sync")
+                _LOGGER.info("📤 Sending force sync")
                 force_sync_payload = {"fpsh": 1}
                 
                 if MQTT_AVAILABLE and self.mqtt_client and self.mqtt_client.is_connected:
                     success = self.mqtt_client.force_sync(device_id)
                     if success:
-                        _LOGGER.info("✅ Force sync via EXACT MQTT")
+                        _LOGGER.info("✅ Force sync via MQTT")
+                        control_result = {"method": "FORCE_SYNC_MQTT", "status": "success"}
                 else:
                     force_sync_response = await self.session.post(
                         f"{self.base_url}{CONTROL_ENDPOINT.format(device_id=device_id)}",
@@ -636,36 +882,67 @@ class BluestarAPI:
                     
                     if force_sync_response.ok:
                         _LOGGER.info("✅ Force sync via HTTP")
+                        control_result = {"method": "FORCE_SYNC_HTTP", "status": "success"}
                     else:
-                        _LOGGER.warning("⚠️ Force sync failed")
+                        response_text = await force_sync_response.text()
+                        _LOGGER.error(f"❌ Force sync failed with status {force_sync_response.status}: {response_text}")
             except Exception as error:
-                _LOGGER.warning(f"⚠️ Force sync failed: {error}")
+                _LOGGER.error(f"❌ Force sync failed: {error}", exc_info=True)
 
-        # Get updated device state
-        updated_device_response = await self.session.get(f"{self.base_url}{DEVICES_ENDPOINT}", headers=headers)
-        updated_device_data = await updated_device_response.json()
-        updated_state = updated_device_data.get("states", {}).get(device_id, {})
+        # If all methods failed, log error but don't raise (allow HTTP to work)
+        if not control_result:
+            error_msg = f"All control methods failed for device {device_id}. This may be normal if device is offline."
+            _LOGGER.warning(f"⚠️ {error_msg}")
+            # Don't raise error - HTTP API might still work, just log the warning
+            # The coordinator will handle state updates
+
+        # Get updated device state (wait a bit longer if MQTT was used to allow device to process)
+        if control_result and control_result.get("method") == "MQTT":
+            await asyncio.sleep(1)  # Give device time to process MQTT command
         
-        state = {
-            "power": updated_state.get("state", {}).get("pow") == 1,
-            "mode": updated_state.get("state", {}).get("mode", 2),
-            "temperature": updated_state.get("state", {}).get("stemp", "24"),
-            "currentTemp": updated_state.get("state", {}).get("ctemp", "27.5"),
-            "fanSpeed": updated_state.get("state", {}).get("fspd", 2),
-            "swing": updated_state.get("state", {}).get("vswing") != 0,
-            "display": updated_state.get("state", {}).get("display") != 0,
-            "connected": updated_state.get("connected", False),
-            "timestamp": int(asyncio.get_event_loop().time() * 1000),
-            "rssi": updated_state.get("state", {}).get("rssi", -45),
-            "error": updated_state.get("state", {}).get("err", 0),
-            "source": updated_state.get("state", {}).get("src", "unknown")
-        }
+        try:
+            updated_device_response = await self.session.get(f"{self.base_url}{DEVICES_ENDPOINT}", headers=headers)
+            if updated_device_response.ok:
+                updated_device_data = await updated_device_response.json()
+                updated_state = updated_device_data.get("states", {}).get(device_id, {})
+                
+                state = {
+                    "power": updated_state.get("state", {}).get("pow") == 1,
+                    "mode": updated_state.get("state", {}).get("mode", 2),
+                    "temperature": updated_state.get("state", {}).get("stemp", "24"),
+                    "currentTemp": updated_state.get("state", {}).get("ctemp", "27.5"),
+                    "fanSpeed": updated_state.get("state", {}).get("fspd", 2),
+                    "swing": updated_state.get("state", {}).get("vswing") != 0,
+                    "display": updated_state.get("state", {}).get("display") != 0,
+                    "connected": updated_state.get("connected", False),
+                    "timestamp": int(time.time() * 1000),
+                    "rssi": updated_state.get("state", {}).get("rssi", -45),
+                    "error": updated_state.get("state", {}).get("err", 0),
+                    "source": updated_state.get("state", {}).get("src", "unknown")
+                }
+            else:
+                _LOGGER.warning(f"Failed to get updated device state: {updated_device_response.status}")
+                state = {}
+        except Exception as error:
+            _LOGGER.warning(f"Error getting updated device state: {error}")
+            state = {}
 
+        # Always return a result, even if all methods failed
+        if control_result:
+            message = "Control command sent successfully"
+            method = control_result.get("method", "UNKNOWN")
+        else:
+            message = "Control command attempted (may have failed - check logs)"
+            method = "HTTP_FALLBACK_ATTEMPTED"
+            control_result = {"method": method, "status": "unknown", "note": "No successful method found"}
+        
+        _LOGGER.info(f"📤 Final control result: {json.dumps(control_result, indent=2)}")
+        
         return {
-            "message": "Control command sent successfully",
+            "message": message,
             "deviceId": device_id,
             "controlData": control_data,
             "state": state,
-            "method": "EXACT_BLUESTAR_CONTROL",
+            "method": method,
             "api": control_result
         }

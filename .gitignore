@@ -128,22 +128,44 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# IDE
+# Home Assistant specific
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Development files
+work/
+bluestar_main_decompiled/
+*.apk
+*.xapk
+*.zip
+*.tar.gz
+
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
-
-# Home Assistant
-.homeassistant/
-
-# Home Assistant
-.homeassistant/
-
-# Custom components (commented out for HACS integration)
-# custom_components/

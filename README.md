@@ -1,161 +1,225 @@
-# Bluestar Smart AC (Unofficial) - Home Assistant Integration
+# ❄️ Bluestar AC - Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
-[![GitHub release](https://img.shields.io/github/release/sankarhansdah/bluestar_hacs.svg)](https://github.com/sankarhansdah/bluestar_hacs/releases)
-[![GitHub stars](https://img.shields.io/github/stars/sankarhansdah/bluestar_hacs.svg?style=social&label=Stars)](https://github.com/sankarhansdah/bluestar_hacs)
+[![maintainer](https://img.shields.io/badge/maintainer-%40sankarhansdah-blue.svg)](https://github.com/sankarhansdah)
+[![version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/sankarhansdah/Bluestar-Smart-AC)
 
-An **unofficial** Home Assistant integration for Bluestar Smart AC units. This integration provides **standalone** control over your Bluestar Smart AC devices through Home Assistant, including temperature control, fan speed, swing modes, and more.
+A **Home Assistant integration** for controlling Bluestar Smart AC units. This integration provides full control over your AC including temperature, mode, fan speed, swing, and special modes using the **exact same communication method** as the official Bluestar app.
 
-## ✨ Features
+## 🚀 Features
 
-- 🌡️ **Climate Control**: Full HVAC mode control (Off, Fan Only, Cool, Dry, Auto)
-- 🌪️ **Fan Control**: Multiple fan speeds (Low, Medium, High, Auto)
-- 🔄 **Swing Control**: Independent vertical and horizontal swing control
-- 📱 **Display Control**: Turn AC display on/off
-- 📊 **Sensors**: RSSI signal strength and error code monitoring
-- 🔄 **Force Sync**: Manual device state synchronization
-- 🚀 **Standalone Operation**: Works directly with Bluestar cloud API
-- ⚡ **Optional Gateway**: Enhanced performance with MQTT gateway
-- ☁️ **Cloud Integration**: Direct API access with automatic fallback
-
-## 🚀 Installation
-
-### Via HACS (Recommended)
-
-1. **Add Custom Repository**:
-   - Open HACS → Integrations
-   - Click the three dots menu → Custom repositories
-   - Add repository: `sankarhansdah/bluestar_hacs`
-   - Category: Integration
-
-2. **Install Integration**:
-   - Find "Bluestar Smart AC (Unofficial)" in HACS
-   - Click Install
-   - Restart Home Assistant
-
-3. **Configure Integration**:
-   - Go to Settings → Devices & Services
-   - Click "Add Integration"
-   - Search for "Bluestar Smart AC"
-   - Enter your credentials (gateway URL is optional)
-
-### Manual Installation
-
-1. **Download Integration**:
-   ```bash
-   cd /config/custom_components
-   git clone https://github.com/sankarhansdah/bluestar_hacs.git
-   ```
-
-2. **Restart Home Assistant**
-
-3. **Add Integration**:
-   - Go to Settings → Devices & Services
-   - Click "Add Integration"
-   - Search for "Bluestar Smart AC"
-
-## 🔧 Configuration
-
-### Required Information
-
-- **Phone Number**: Your Bluestar account phone number
-- **Password**: Your Bluestar account password
-- **API Base URL**: `https://n3on22cp53.execute-api.ap-south-1.amazonaws.com/prod` (default)
-
-### Optional Configuration
-
-- **MQTT Gateway URL**: For enhanced performance (optional)
+- **🌡️ Full AC Control**: Power, temperature, mode, fan speed, swing
+- **💨 Dedicated Fan Entity**: Speed control with percentage
+- **🔌 Switch Controls**: Display and buzzer controls
+- **🎛️ All AC Modes**: Auto, Cool, Dry, Fan modes
+- **🌿 Special Modes**: Eco, Turbo, Sleep modes
+- **🔄 Swing Control**: Horizontal and vertical swing
+- **⚡ Real-time Control**: Direct AWS IoT MQTT communication
+- **🏠 Native Home Assistant**: Full integration with HA ecosystem
 
 ## 📱 Screenshots
 
 *[Add screenshots of your integration in Home Assistant here]*
 
-## 🛠️ Troubleshooting
+## 🏗️ Installation
 
-### Common Issues
+### HACS Installation (Recommended)
 
-1. **"Unable to connect to Bluestar API"**
-   - ✅ **FIXED**: This was caused by incorrect `auth_type` format
-   - The integration now uses the correct numeric format
+1. **Install HACS** if you haven't already: [HACS Installation Guide](https://hacs.xyz/docs/installation/installation/)
+2. **Add this repository** to HACS:
+   - Go to HACS → Integrations
+   - Click the 3 dots menu → Custom repositories
+   - Add repository: `sankarhansdah/Bluestar-Smart-AC`
+   - Category: Integration
+3. **Install the integration**:
+   - Search for "Bluestar AC" in HACS
+   - Click "Download"
+   - Restart Home Assistant
+4. **Add the integration**:
+   - Go to Settings → Devices & Services
+   - Click "+ Add Integration"
+   - Search for "Bluestar AC"
+   - Follow the setup wizard
 
-2. **"Invalid credentials"**
-   - Verify your phone number and password
-   - Try different phone number formats (with/without +91)
+### Manual Installation
 
-3. **"No devices found"**
-   - Ensure your Bluestar account has devices registered
-   - Check if devices are online in the official Bluestar app
+1. **Download** the latest release
+2. **Copy** `custom_components/bluestar_ac/` to your Home Assistant `config/custom_components/` directory
+3. **Restart** Home Assistant
+4. **Add integration** via the UI
 
-### Debug Mode
+## ⚙️ Configuration
 
-Enable debug logging in `configuration.yaml`:
+### Required Information
+
+- **Username/Phone Number**: Your Bluestar account credentials
+- **Password**: Your Bluestar account password
+- **Device ID**: Your AC's device ID (e.g., `24587ca091f8`)
+- **Authentication Type**: Usually `bluestar` (default)
+
+### Setup Steps
+
+1. **Get Your Device ID**:
+   - Check your Bluestar app for device information
+   - Or use the device ID from your working setup
+
+2. **Configure the Integration**:
+   - Enter your credentials
+   - Enter your device ID
+   - Test the connection
+   - Save the configuration
+
+## 🎯 Usage
+
+### Climate Entity
+
+The main climate entity provides:
+- **Power Control**: Turn AC on/off
+- **Temperature Control**: Set target temperature (16°C - 30°C)
+- **Mode Control**: Auto, Cool, Dry, Fan modes
+- **Fan Speed**: Auto, Low, Medium, High
+- **Swing Control**: Horizontal, Vertical, Both, Off
+- **Preset Modes**: Eco, Turbo, Sleep, None
+
+### Fan Entity
+
+Dedicated fan control with:
+- **Speed Control**: Auto, Low, Medium, High
+- **Percentage Control**: 0% (Auto) to 100% (High)
+
+### Switch Entities
+
+Additional controls:
+- **Display Switch**: Turn AC display on/off
+- **Buzzer Switch**: Turn AC buzzer on/off
+
+## 🔧 Troubleshooting
+
+### Connection Issues
+
+1. **Check Credentials**: Verify username/password are correct
+2. **Verify Device ID**: Ensure device ID matches your AC
+3. **Network Access**: Ensure Home Assistant can access the internet
+4. **Check Logs**: Look for error messages in Home Assistant logs
+
+### Control Issues
+
+1. **Verify AC is Online**: Ensure AC is connected to WiFi
+2. **Check Integration Status**: Verify integration shows as "Connected"
+3. **Restart Integration**: Try removing and re-adding the integration
+
+### Common Error Messages
+
+- **"connection_failed"**: Check credentials and device ID
+- **"already_configured"**: Device is already set up
+- **"unknown"**: Unexpected error, check logs
+
+## 🌟 Advanced Features
+
+### Automation Examples
+
 ```yaml
-logger:
-  default: warning
-  logs:
-    custom_components.bluestar_ac: debug
+# Turn AC on when temperature is high
+automation:
+  - alias: "AC Auto On - High Temp"
+    trigger:
+      platform: numeric_state
+      entity_id: sensor.living_room_temperature
+      above: 28
+    action:
+      - service: climate.set_hvac_mode
+        target:
+          entity_id: climate.bluestar_ac_24587ca091f8
+        data:
+          hvac_mode: cool
+      - service: climate.set_temperature
+        target:
+          entity_id: climate.bluestar_ac_24587ca091f8
+        data:
+          temperature: 24
+
+# Turn AC off when leaving home
+automation:
+  - alias: "AC Auto Off - Away"
+    trigger:
+      platform: state
+      entity_id: person.your_name
+      to: "not_home"
+    action:
+      - service: climate.set_hvac_mode
+        target:
+          entity_id: climate.bluestar_ac_24587ca091f8
+        data:
+          hvac_mode: off
 ```
 
-## 🔧 Technical Details
+### Dashboard Integration
 
-### API Integration
+- **Lovelace cards** for AC control
+- **Custom buttons** for quick actions
+- **Temperature graphs** and history
+- **Status indicators** for all features
 
-- **Base URL**: `https://n3on22cp53.execute-api.ap-south-1.amazonaws.com/prod`
-- **Authentication**: Phone number + password
-- **Protocol**: REST API + AWS IoT MQTT
-- **Headers**: Exact match with official Bluestar app
+## 🔬 Technical Details
+
+### Communication Method
+
+This integration uses the **exact same AWS IoT MQTT communication** as the official Bluestar app:
+- **Protocol**: AWS IoT Core MQTT
+- **Authentication**: AWS SigV4 with Bluestar credentials
+- **Payload Format**: JSON with timestamp and source identification
+- **Topics**: AWS IoT Shadow updates
 
 ### Supported Commands
 
 - **Power**: `{"pow": 1, "ts": <timestamp>, "src": "anmq"}`
 - **Temperature**: `{"stemp": "24.0", "ts": <timestamp>, "src": "anmq"}`
-- **Mode**: `{"mode": 1, "ts": <timestamp>, "src": "anmq"}`
+- **Mode**: `{"climate": 1, "ts": <timestamp>, "src": "anmq"}`
 - **Fan Speed**: `{"fspd": 2, "ts": <timestamp>, "src": "anmq"}`
 - **Swing**: `{"hswing": 1, "vswing": 1, "ts": <timestamp>, "src": "anmq"}`
-
-## 📊 Changelog
-
-### Version 2.0.0 (Latest)
-- ✅ **FIXED**: Authentication issue (`auth_type` now uses numeric format)
-- ✅ **IMPROVED**: Better error handling and user messages
-- ✅ **ADDED**: Multiple phone number format support
-- ✅ **ADDED**: API endpoint fallback logic
-- ✅ **ADDED**: Proper timeout handling
-- ✅ **ADDED**: Enhanced logging and debugging
-
-### Version 1.0.0
-- Initial release
-- Basic climate control
-- Fan control
-- Switch controls
+- **Special Modes**: `{"eco": 1, "turbo": 0, "sleep": 0, "ts": <timestamp>, "src": "anmq"}`
 
 ## 🤝 Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Development Setup
+
+1. **Fork** this repository
+2. **Clone** your fork
+3. **Make changes** and test them
+4. **Submit** a pull request
+
+### Testing
+
+1. **Install** the integration in your Home Assistant
+2. **Test** all features thoroughly
+3. **Report** any issues with detailed information
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## ⚠️ Disclaimer
-
-This is an **unofficial** integration. It is not affiliated with or endorsed by Bluestar India. Use at your own risk.
-
-## 🆘 Support
-
-- **Issues**: [GitHub Issues](https://github.com/sankarhansdah/bluestar_hacs/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/sankarhansdah/bluestar_hacs/discussions)
-
 ## 🙏 Acknowledgments
 
-- Bluestar India for the Smart AC platform
-- Home Assistant community for integration framework
-- Contributors and testers
+- **Bluestar India** for their Smart AC platform
+- **Home Assistant community** for the integration framework
+- **HACS** for making custom integrations easy to install
+- **Reverse engineering** of the official mobile app for protocol details
+
+## 📞 Support
+
+- **GitHub Issues**: [Create an issue](https://github.com/sankarhansdah/Bluestar-Smart-AC/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/sankarhansdah/Bluestar-Smart-AC/discussions)
+- **Documentation**: Check the [Wiki](https://github.com/sankarhansdah/Bluestar-Smart-AC/wiki) for detailed guides
+
+## ⭐ Star This Repository
+
+If you find this integration useful, please give it a ⭐ star on GitHub!
 
 ---
 
 **Made with ❤️ for the Home Assistant community**
+
+*This integration transforms your Bluestar AC into a smart home superstar!* 🌟❄️🏠
+

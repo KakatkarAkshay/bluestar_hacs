@@ -2,33 +2,32 @@
   "config": {
     "step": {
       "user": {
-        "title": "Bluestar Smart AC Setup",
-        "description": "Configure your Bluestar Smart AC integration. This integration works standalone by connecting directly to the Bluestar API with built-in MQTT support for optimal performance.",
+        "title": "Bluestar AC Configuration",
+        "description": "Enter your Bluestar Smart AC credentials",
         "data": {
-          "phone": "Phone Number",
+          "email": "Email",
           "password": "Password",
-          "base_url": "Bluestar API Base URL"
+          "region": "Region"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate",
+        "description": "Please enter your new password",
+        "data": {
+          "password": "Password"
         }
       }
     },
-        "error": {
-          "cannot_connect": "Unable to connect to Bluestar API. The API may be temporarily down (502 error). The official app may still work due to cached credentials. Please try again later.",
-          "invalid_auth": "Invalid credentials. Please check your phone number and password. The integration will try different phone number formats automatically.",
-          "unknown": "Unexpected error occurred. Please check the logs for more details and try again."
-        },
+    "error": {
+      "invalid_auth": "Invalid authentication",
+      "no_devices": "No devices found",
+      "unknown": "Unexpected error"
+    },
     "abort": {
-      "already_configured": "This phone number is already configured."
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Bluestar Smart AC Options",
-        "description": "Configure additional options for your Bluestar Smart AC integration.",
-        "data": {
-          "base_url": "Bluestar API Base URL"
-        }
-      }
+      "reauth_successful": "Re-authentication successful"
     }
   }
 }
+
+
+
