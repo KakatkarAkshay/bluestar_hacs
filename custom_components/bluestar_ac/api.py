@@ -383,15 +383,57 @@ class BluestarMQTTClient:
         
         try:
             formatted_payload = {}
-            for key, value in control_payload.items():
-                if key == "stemp":
-                    if isinstance(value, (int, float)):
-                        formatted_payload[key] = f"{float(value):.1f}"
-                    else:
-                        formatted_payload[key] = str(value)
-                elif key in ["pow", "mode", "fspd", "vswing", "hswing", "display"]:
-                    formatted_payload[key] = int(value)
+            
+            # Handle mode as object with value, fspd, and optionally stemp
+            # Based on actual MQTT protocol: {"mode": {"value": 0, "fspd": 2}}
+            if "mode" in control_payload:
+                mode_value = control_payload["mode"]
+                mode_obj = {}
+                
+                # If mode is already an object (from control_device), use it
+                if isinstance(mode_value, dict) and "value" in mode_value:
+                    mode_obj = mode_value.copy()
                 else:
+                    # Convert simple mode integer to object format
+                    mode_obj["value"] = int(mode_value)
+                    
+                    # Include fspd if provided in control_payload
+                    if "fspd" in control_payload:
+                        mode_obj["fspd"] = int(control_payload["fspd"])
+                    
+                    # Include stemp if provided in control_payload (for modes that need temperature)
+                    if "stemp" in control_payload:
+                        stemp_value = control_payload["stemp"]
+                        if isinstance(stemp_value, (int, float)):
+                            mode_obj["stemp"] = f"{float(stemp_value):.1f}"
+                        else:
+                            mode_obj["stemp"] = str(stemp_value)
+                
+                formatted_payload["mode"] = mode_obj
+            else:
+                # No mode change, but include fspd if provided
+                if "fspd" in control_payload:
+                    formatted_payload["fspd"] = int(control_payload["fspd"])
+            
+            # Handle other fields
+            for key, value in control_payload.items():
+                if key == "mode":
+                    # Already handled above
+                    continue
+                elif key == "stemp":
+                    # Only include stemp if mode is not being set (mode object will include it)
+                    if "mode" not in control_payload:
+                        if isinstance(value, (int, float)):
+                            formatted_payload[key] = f"{float(value):.1f}"
+                        else:
+                            formatted_payload[key] = str(value)
+                elif key == "fspd":
+                    # Only include fspd if mode is not being set (mode object will include it)
+                    if "mode" not in control_payload:
+                        formatted_payload[key] = int(value)
+                elif key in ["pow", "vswing", "hswing", "display"]:
+                    formatted_payload[key] = int(value)
+                elif key not in ["ts", "src"]:  # Skip ts and src, we'll add them separately
                     formatted_payload[key] = value
             
             formatted_payload[self.SRC_KEY] = self.SRC_VALUE
@@ -688,16 +730,34 @@ class BluestarAPI:
         
         if control_data.get("pow") is not None:
             control_payload["pow"] = int(control_data["pow"])
+        
+        # Handle mode - preserve object format if it's already an object, otherwise convert to int
         if control_data.get("mode") is not None:
-            control_payload["mode"] = int(control_data["mode"])
-        if control_data.get("stemp") is not None:
+            mode_value = control_data["mode"]
+            if isinstance(mode_value, dict) and "value" in mode_value:
+                # Mode is already in object format (from climate.py), preserve it
+                control_payload["mode"] = mode_value
+                # Also extract fspd and stemp from mode object if present
+                if "fspd" in mode_value:
+                    control_payload["fspd"] = int(mode_value["fspd"])
+                if "stemp" in mode_value:
+                    control_payload["stemp"] = mode_value["stemp"]
+            else:
+                # Mode is a simple integer, convert it
+                control_payload["mode"] = int(mode_value)
+        
+        # Only include stemp if not already in mode object
+        if control_data.get("stemp") is not None and "stemp" not in control_payload:
             stemp_value = control_data["stemp"]
             if isinstance(stemp_value, (int, float)):
                 control_payload["stemp"] = f"{float(stemp_value):.1f}"
             else:
                 control_payload["stemp"] = str(stemp_value)
-        if control_data.get("fspd") is not None:
+        
+        # Only include fspd if not already in mode object
+        if control_data.get("fspd") is not None and "fspd" not in control_payload:
             control_payload["fspd"] = int(control_data["fspd"])
+        
         if control_data.get("vswing") is not None:
             control_payload["vswing"] = int(control_data["vswing"])
         if control_data.get("hswing") is not None:

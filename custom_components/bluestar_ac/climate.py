@@ -240,9 +240,43 @@ class BluestarACClimate(CoordinatorEntity, ClimateEntity):
         try:
             if hvac_mode == HVACMode.OFF:
                 await self.coordinator.set_power(self._device_id, False)
-            elif hvac_mode == HVACMode.COOL:
+            else:
+                # Get current state to include fan speed and temperature
+                device = self.coordinator.get_device(self._device_id)
+                current_fan_speed = 7  # Default to auto
+                current_temp = DEFAULT_TEMPERATURE
+                
+                if device:
+                    state = device.get("state", {})
+                    current_fan_speed = state.get("fan_speed", 7)
+                    temp_str = state.get("temperature", str(DEFAULT_TEMPERATURE))
+                    try:
+                        current_temp = float(temp_str)
+                    except (ValueError, TypeError):
+                        current_temp = DEFAULT_TEMPERATURE
+                
                 bluestar_mode = HA_TO_BLUESTAR_MODE.get(hvac_mode, 2)
-                await self.coordinator.control_device(self._device_id, {"pow": 1, "mode": bluestar_mode})
+                
+                # Format mode as object with value, fspd, and stemp
+                # Based on actual MQTT protocol: {"mode": {"value": 2, "stemp": "24.0", "fspd": 7}}
+                # Cool mode (2) requires stemp and fspd
+                mode_obj = {
+                    "value": bluestar_mode,
+                    "fspd": current_fan_speed  # Always use current fan speed
+                }
+                
+                # Include temperature for modes that need it (Cool=2, Dry=3, Auto=4)
+                # Fan mode (0) doesn't need temperature
+                if bluestar_mode in [2, 3, 4]:  # Cool, Dry, Auto
+                    mode_obj["stemp"] = f"{current_temp:.1f}"  # Format as XX.X
+                
+                control_data = {
+                    "pow": 1,
+                    "mode": mode_obj
+                }
+                
+                _LOGGER.warning(f"📤 Mode control data: {control_data}")
+                await self.coordinator.control_device(self._device_id, control_data)
         except Exception as e:
             _LOGGER.error(f"❌ set_hvac_mode failed: {e}", exc_info=True)
             raise
