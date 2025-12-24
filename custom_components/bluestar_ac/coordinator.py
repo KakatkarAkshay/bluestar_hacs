@@ -65,13 +65,18 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                 state = self.states.get(device_id, {})
                 device_state = state.get("state", {})
                 
+                # Extract mode value if it's a dictionary (shouldn't happen from API, but be safe)
+                mode_value = device_state.get("mode", 2)
+                if isinstance(mode_value, dict) and "value" in mode_value:
+                    mode_value = mode_value["value"]
+                
                 processed_devices[device_id] = {
                     "id": device_id,
                     "name": device.get("user_config", {}).get("name", "AC"),
                     "type": "ac",
                     "state": {
                         "power": device_state.get("pow", 0) == 1,
-                        "mode": device_state.get("mode", 2),
+                        "mode": mode_value,
                         "temperature": device_state.get("stemp", "24"),
                         "current_temp": device_state.get("ctemp", "27.5"),
                         "fan_speed": device_state.get("fspd", 2),

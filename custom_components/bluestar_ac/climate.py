@@ -173,6 +173,9 @@ class BluestarACClimate(CoordinatorEntity, ClimateEntity):
             if not power:
                 return HVACMode.OFF
             mode = state.get("mode", 2)
+            # Extract mode value if it's a dictionary, otherwise use the value directly
+            if isinstance(mode, dict) and "value" in mode:
+                mode = mode["value"]
             return BLUESTAR_TO_HA_MODE.get(mode, HVACMode.COOL)
         return HVACMode.OFF
     
