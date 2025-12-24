@@ -136,7 +136,11 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                     if key == "pow":
                         device_state["power"] = value == 1
                     elif key == "mode":
-                        device_state["mode"] = value
+                        # Extract mode value if it's a dictionary, otherwise use the value directly
+                        if isinstance(value, dict) and "value" in value:
+                            device_state["mode"] = value["value"]
+                        else:
+                            device_state["mode"] = value
                     elif key == "stemp":
                         device_state["temperature"] = str(value)
                     elif key == "fspd":
@@ -243,7 +247,12 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             if "pow" in payload:
                 device_state["power"] = payload["pow"] == 1
             if "mode" in payload:
-                device_state["mode"] = payload["mode"]
+                # Extract mode value if it's a dictionary, otherwise use the value directly
+                mode_value = payload["mode"]
+                if isinstance(mode_value, dict) and "value" in mode_value:
+                    device_state["mode"] = mode_value["value"]
+                else:
+                    device_state["mode"] = mode_value
             if "stemp" in payload:
                 device_state["temperature"] = str(payload["stemp"])
             if "ctemp" in payload:
