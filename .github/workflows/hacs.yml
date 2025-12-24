@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: hacs/integration-action@main
+      - uses: hacs/action@main
         with:
-          CATEGORY: integration
+          category: integration
 
 
 
