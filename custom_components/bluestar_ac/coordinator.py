@@ -99,11 +99,14 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("C5 coordinator got %d devices: %s", len(processed_devices), str(list(processed_devices.keys()))[:200])
             
             # Subscribe to MQTT state reports for all devices
-            if not self._mqtt_subscribed and self.api.mqtt_client and self.api.mqtt_client.is_connected:
+            if not self._mqtt_subscribed and self.api.mqtt_client:
                 device_ids = list(processed_devices.keys())
-                self.api.subscribe_to_devices(device_ids)
-                self._mqtt_subscribed = True
-                _LOGGER.info(f"✅ Subscribed to MQTT state reports for {len(device_ids)} device(s)")
+                try:
+                    await self.api.subscribe_to_devices(device_ids)
+                    self._mqtt_subscribed = True
+                    _LOGGER.info(f"✅ Subscribed to MQTT state reports for {len(device_ids)} device(s)")
+                except Exception as error:
+                    _LOGGER.warning(f"⚠️ Failed to subscribe to MQTT devices: {error}")
             
             return {
                 "devices": processed_devices,
@@ -166,18 +169,6 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
 
         except BluestarAPIError as err:
             _LOGGER.error(f"Control failed for device {device_id}: {err}")
-            raise
-
-    async def force_sync_device(self, device_id: str) -> Dict[str, Any]:
-        """Force sync a device."""
-        try:
-            # Ensure we're logged in before making requests
-            if not self.api.session_token:
-                await self.api.login()
-            
-            return self.api.force_sync(device_id)
-        except BluestarAPIError as err:
-            _LOGGER.error(f"Force sync failed for device {device_id}: {err}")
             raise
 
     def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
