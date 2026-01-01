@@ -880,6 +880,7 @@ class BluestarAPI:
         if control_result and control_result.get("method") == "MQTT":
             await asyncio.sleep(1)  # Give device time to process MQTT command
         
+        state = {}
         try:
             updated_device_response = await self.session.get(f"{self.base_url}{DEVICES_ENDPOINT}", headers=headers)
             if updated_device_response.ok:
@@ -902,14 +903,12 @@ class BluestarAPI:
                 }
             else:
                 _LOGGER.warning(f"Failed to get updated device state: {updated_device_response.status}")
-                state = {}
         except Exception as error:
             _LOGGER.warning(f"Error getting updated device state: {error}")
-            state = {}
 
         # Return result
-            message = "Control command sent successfully"
-        method = control_result.get("method", "MQTT")
+        message = "Control command sent successfully"
+        method = control_result.get("method", "MQTT") if control_result else "MQTT"
         
         _LOGGER.info(f"📤 Final control result: {json.dumps(control_result, indent=2)}")
         
