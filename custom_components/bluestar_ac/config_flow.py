@@ -3,16 +3,15 @@ import logging
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.const import CONF_DEVICE_ID, CONF_PASSWORD
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import (
-    DOMAIN,
-    DEFAULT_BASE_URL,
-)
+from .const import DOMAIN, DEFAULT_BASE_URL
 from .api import BluestarAPI, BluestarAPIError
 
 _LOGGER = logging.getLogger(__name__)
+
 
 class BluestarACConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Bluestar AC."""
@@ -21,143 +20,116 @@ class BluestarACConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     
     def __init__(self):
         """Initialize the config flow."""
-        self._errors = {}
+        self._phone = None
+        self._password = None
+        self._devices = []
+        self._api = None
     
     async def async_step_user(self, user_input=None) -> FlowResult:
-        """Handle the initial step."""
-        self._errors = {}
+        """Handle the initial step - login credentials."""
+        errors = {}
         
         if user_input is not None:
+            self._phone = user_input["phone"]
+            self._password = user_input[CONF_PASSWORD]
+            
             try:
-                # Get phone/username (accept both for compatibility)
-                phone = user_input.get("phone") or user_input.get("username")
-                password = user_input["password"]
-                base_url = user_input.get("base_url", DEFAULT_BASE_URL)
-                
-                # Test the connection using BluestarAPI
-                api = BluestarAPI(
-                    phone=phone,
-                    password=password,
-                    base_url=base_url,
+                self._api = BluestarAPI(
+                    phone=self._phone,
+                    password=self._password,
+                    base_url=DEFAULT_BASE_URL,
                 )
                 
-                try:
-                    # Test login
-                    await api.login()
+                await self._api.login()
+                devices_data = await self._api.get_devices()
+                self._devices = devices_data.get("things", [])
+                
+                if not self._devices:
+                    errors["base"] = "no_devices"
+                else:
+                    # Move to device selection step
+                    return await self.async_step_device()
                     
-                    # Test getting devices
-                    devices_data = await api.get_devices()
-                    things = devices_data.get("things", [])
-                    
-                    # Check if device_id is provided and valid
-                    device_id = user_input.get("device_id", "").strip()
-                    if device_id:
-                        # Verify device exists
-                        device_ids = [device.get("thing_id") for device in things]
-                        if device_id not in device_ids:
-                            self._errors["base"] = "device_not_found"
-                            await api.close()
-                            return self.async_show_form(
-                                step_id="user",
-                                data_schema=vol.Schema({
-                                    vol.Required("phone", default=phone): str,
-                                    vol.Required("password"): str,
-                                    vol.Optional("device_id", default=device_id): str,
-                                    vol.Optional("base_url", default=base_url): str,
-                                }),
-                                errors=self._errors,
-                            )
-                    else:
-                        # If no device_id provided, use first device
-                        if things:
-                            device_id = things[0].get("thing_id")
-                            _LOGGER.info(f"Using first device: {device_id}")
-                        else:
-                            self._errors["base"] = "no_devices"
-                            await api.close()
-                            return self.async_show_form(
-                                step_id="user",
-                                data_schema=vol.Schema({
-                                    vol.Required("phone", default=phone): str,
-                                    vol.Required("password"): str,
-                                    vol.Optional("device_id"): str,
-                                    vol.Optional("base_url", default=base_url): str,
-                                }),
-                                errors=self._errors,
-                            )
-                    
-                    await api.close()
-                    
-                    # Create unique ID
-                    unique_id = f"bluestar_ac_{device_id}"
-                    
-                    # Check if already configured
-                    await self.async_set_unique_id(unique_id)
-                    self._abort_if_unique_id_configured()
-                    
-                    # Get device name for title
-                    device_name = "AC"
-                    for device in things:
-                        if device.get("thing_id") == device_id:
-                            device_name = device.get("user_config", {}).get("name", "AC")
-                            break
-                    
-                    # Create config entry
-                    return self.async_create_entry(
-                        title=f"Bluestar AC {device_name}",
-                        data={
-                            "phone": phone,
-                            "password": password,
-                            "device_id": device_id,
-                            "base_url": base_url,
-                        }
-                    )
-                    
-                except BluestarAPIError as e:
-                    _LOGGER.error("API error during config: %s", e)
-                    if e.status_code == 401:
-                        self._errors["base"] = "invalid_auth"
-                    else:
-                        self._errors["base"] = "connection_failed"
-                        await api.close()
-                except Exception as ex:
-                    _LOGGER.error("Config flow error: %s", ex, exc_info=True)
-                    self._errors["base"] = "unknown"
-                    try:
-                        await api.close()
-                    except:
-                        pass
-            except Exception as ex:
-                _LOGGER.error("Config flow error: %s", ex, exc_info=True)
-                self._errors["base"] = "unknown"
+            except BluestarAPIError as e:
+                if e.status_code == 401:
+                    errors["base"] = "invalid_auth"
+                else:
+                    errors["base"] = "connection_failed"
+            except Exception:
+                errors["base"] = "unknown"
+            finally:
+                if self._api and errors:
+                    await self._api.close()
+                    self._api = None
         
-        # Show the form
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required("phone"): str,
-                vol.Required("password"): str,
-                vol.Optional("device_id", default=""): str,
-                vol.Optional("base_url", default=DEFAULT_BASE_URL): str,
+                vol.Required(CONF_PASSWORD): str,
             }),
-            errors=self._errors,
+            errors=errors,
+        )
+    
+    async def async_step_device(self, user_input=None) -> FlowResult:
+        """Handle device selection step."""
+        errors = {}
+        
+        if user_input is not None:
+            device_id = user_input[CONF_DEVICE_ID]
+            
+            # Find device name
+            device_name = "AC"
+            for device in self._devices:
+                if device.get("thing_id") == device_id:
+                    device_name = device.get("user_config", {}).get("name", "AC")
+                    break
+            
+            # Close API
+            if self._api:
+                await self._api.close()
+                self._api = None
+            
+            # Set unique ID
+            unique_id = f"bluestar_ac_{device_id}"
+            await self.async_set_unique_id(unique_id)
+            self._abort_if_unique_id_configured()
+            
+            return self.async_create_entry(
+                title=f"Bluestar {device_name}",
+                data={
+                    "phone": self._phone,
+                    CONF_PASSWORD: self._password,
+                    CONF_DEVICE_ID: device_id,
+                }
+            )
+        
+        # Build device options
+        device_options = {
+            device.get("thing_id"): device.get("user_config", {}).get("name", device.get("thing_id"))
+            for device in self._devices
+        }
+        
+        return self.async_show_form(
+            step_id="device",
+            data_schema=vol.Schema({
+                vol.Required(CONF_DEVICE_ID): vol.In(device_options),
+            }),
+            errors=errors,
         )
     
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        """Get the options flow for this handler."""
+        """Get the options flow."""
         return BluestarACOptionsFlow()
+
 
 class BluestarACOptionsFlow(config_entries.OptionsFlow):
     """Handle options."""
     
     async def async_step_init(self, user_input=None):
         """Manage the options."""
-        # No options to configure currently
         if user_input is not None:
             return self.async_create_entry(title="", data={})
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema({}),
-        )
+        return self.async_show_form(step_id="init", data_schema=vol.Schema({}))
