@@ -103,7 +103,7 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.warning("Requesting initial device states via MQTT shadow")
                     await self.api.request_device_states(device_ids)
                     # Give MQTT time to receive the shadow response
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                     _LOGGER.warning(f"After wait, device state power: {processed_devices.get(device_ids[0], {}).get('state', {}).get('power') if device_ids else 'no devices'}")
                 except Exception as error:
                     _LOGGER.warning(f"Failed to subscribe to MQTT: {error}")

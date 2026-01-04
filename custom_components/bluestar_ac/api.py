@@ -228,10 +228,13 @@ class BluestarMQTTClient:
             return False
     
     def _on_connect(self, client, userdata, flags, rc):
+        _LOGGER.warning(f"MQTT _on_connect called with rc={rc}")
         if rc == 0:
             self.is_connected = True
+            _LOGGER.warning("MQTT connected successfully")
         else:
             self.is_connected = False
+            _LOGGER.warning(f"MQTT connection failed with rc={rc}")
     
     def _on_disconnect(self, client, userdata, rc):
         was_connected = self.is_connected
@@ -313,18 +316,22 @@ class BluestarMQTTClient:
     
     async def subscribe_to_device(self, device_id: str) -> bool:
         if not await self.ensure_connected() or not self.client:
+            _LOGGER.warning(f"Cannot subscribe for {device_id}: not connected")
             return False
         
         try:
             topic = self.SUB_STATE_REPORTED_TOPIC % device_id
-            self.client.subscribe(topic, qos=0)
+            result1 = self.client.subscribe(topic, qos=0)
+            _LOGGER.warning(f"Subscribed to {topic}: result={result1}")
             
             shadow_topic = self.SUB_SHADOW_GET_ACCEPTED_TOPIC % device_id
-            self.client.subscribe(shadow_topic, qos=0)
+            result2 = self.client.subscribe(shadow_topic, qos=0)
+            _LOGGER.warning(f"Subscribed to {shadow_topic}: result={result2}")
             
             self.subscribed_devices.add(device_id)
             return True
-        except Exception:
+        except Exception as e:
+            _LOGGER.warning(f"Error subscribing: {e}")
             return False
     
     async def request_device_state(self, device_id: str) -> bool:
