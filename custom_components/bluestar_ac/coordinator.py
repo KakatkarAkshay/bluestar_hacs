@@ -100,11 +100,23 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.api.subscribe_to_devices(device_ids)
                     self._mqtt_subscribed = True
-                    _LOGGER.warning("Requesting initial device states via MQTT shadow")
-                    await self.api.request_device_states(device_ids)
-                    # Give MQTT time to receive the shadow response
-                    await asyncio.sleep(0.5)
-                    _LOGGER.warning(f"After wait, device state power: {processed_devices.get(device_ids[0], {}).get('state', {}).get('power') if device_ids else 'no devices'}")
+                    
+                    # Keep requesting state until we get it
+                    for attempt in range(10):
+                        _LOGGER.warning(f"Requesting initial device states via MQTT shadow (attempt {attempt + 1})")
+                        await self.api.request_device_states(device_ids)
+                        await asyncio.sleep(2.0)
+                        
+                        # Check if we got the state
+                        if device_ids:
+                            device_state = processed_devices.get(device_ids[0], {}).get('state', {})
+                            # Check if state was updated (timestamp would be non-zero)
+                            if device_state.get('timestamp', 0) > 0:
+                                _LOGGER.warning(f"Got initial state: power={device_state.get('power')}, mode={device_state.get('mode')}")
+                                break
+                        _LOGGER.warning(f"No state received yet, retrying...")
+                    else:
+                        _LOGGER.warning("Failed to get initial state after 10 attempts")
                 except Exception as error:
                     _LOGGER.warning(f"Failed to subscribe to MQTT: {error}")
             

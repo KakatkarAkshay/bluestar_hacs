@@ -243,9 +243,10 @@ class BluestarMQTTClient:
             self._schedule_reconnect()
     
     def _on_message(self, client, userdata, msg):
+        _LOGGER.warning(f"_on_message called! Topic: {msg.topic}")
         try:
             payload = json.loads(msg.payload.decode())
-            _LOGGER.warning(f"MQTT message on topic: {msg.topic}")
+            _LOGGER.warning(f"MQTT message payload keys: {list(payload.keys())}")
             
             if "state/reported" in msg.topic:
                 parts = msg.topic.split("/")
@@ -274,6 +275,7 @@ class BluestarMQTTClient:
     
     def set_message_callback(self, callback):
         self.message_callback = callback
+        _LOGGER.warning(f"Message callback set: {callback is not None}")
     
     def _schedule_reconnect(self):
         if self._reconnecting:
@@ -509,6 +511,8 @@ class BluestarAPI:
             return
         for device_id in device_ids:
             await self.mqtt_client.subscribe_to_device(device_id)
+        # Small delay to let subscriptions propagate
+        await asyncio.sleep(0.2)
     
     async def request_device_states(self, device_ids: List[str]) -> None:
         if not self.mqtt_client or not await self.mqtt_client.ensure_connected():
