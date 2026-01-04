@@ -240,6 +240,8 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         if not state:
             return HVACMode.OFF
         
+        # pow=0 means off, pow=1 means on
+        # The AC has no "off" mode - when pow=0, show as OFF regardless of mode value
         power = state.get("power", False)
         if not power:
             return HVACMode.OFF

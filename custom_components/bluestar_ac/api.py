@@ -902,47 +902,11 @@ class BluestarAPI:
             _LOGGER.error(f"❌ MQTT control failed: {error}", exc_info=True)
             raise BluestarAPIError(f"MQTT control failed: {error}") from error
 
-        # Get updated device state (wait a bit to allow device to process MQTT command)
-        if control_result and control_result.get("method") == "MQTT":
-            await asyncio.sleep(1)  # Give device time to process MQTT command
-        
-        state = {}
-        try:
-            updated_device_response = await self.session.get(f"{self.base_url}{DEVICES_ENDPOINT}", headers=headers)
-            if updated_device_response.ok:
-                updated_device_data = await updated_device_response.json()
-                updated_state = updated_device_data.get("states", {}).get(device_id, {})
-                
-                state = {
-                    "power": updated_state.get("state", {}).get("pow") == 1,
-                    "mode": updated_state.get("state", {}).get("mode", 2),
-                    "temperature": updated_state.get("state", {}).get("stemp", "24"),
-                    "currentTemp": updated_state.get("state", {}).get("ctemp", "27.5"),
-                    "fanSpeed": updated_state.get("state", {}).get("fspd", 2),
-                    "swing": updated_state.get("state", {}).get("vswing") != 0,
-                    "display": updated_state.get("state", {}).get("display") != 0,
-                    "connected": updated_state.get("connected", False),
-                    "timestamp": int(time.time() * 1000),
-                    "rssi": updated_state.get("state", {}).get("rssi", -45),
-                    "error": updated_state.get("state", {}).get("err", 0),
-                    "source": updated_state.get("state", {}).get("src", "unknown")
-                }
-            else:
-                _LOGGER.warning(f"Failed to get updated device state: {updated_device_response.status}")
-        except Exception as error:
-            _LOGGER.warning(f"Error getting updated device state: {error}")
-
-        # Return result
-        message = "Control command sent successfully"
-        method = control_result.get("method", "MQTT") if control_result else "MQTT"
-        
-        _LOGGER.info(f"📤 Final control result: {json.dumps(control_result, indent=2)}")
-        
+        # Return result - don't fetch state from HTTP API as it returns stale/incorrect data
+        # State will be updated via MQTT subscription
         return {
-            "message": message,
+            "message": "Control command sent successfully",
             "deviceId": device_id,
             "controlData": control_data,
-            "state": state,
-            "method": method,
-            "api": control_result
+            "method": "MQTT",
         }

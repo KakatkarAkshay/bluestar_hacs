@@ -27,9 +27,9 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
         """Initialize the coordinator."""
         self.api = api
         self.devices: Dict[str, Any] = {}
-        self.states: Dict[str, Any] = {}
         self._mqtt_subscribed = False
         self._last_mqtt_client = None  # Track MQTT client instance to detect reinit
+        
 
         super().__init__(
             hass,
@@ -67,49 +67,47 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                 self._mqtt_subscribed = False  # Force resubscribe
             
             _LOGGER.debug("C3 fetching devices from API")
-            # Get devices and states
+            # Get device list only - state comes from MQTT
             data = await self.api.get_devices()
             
             _LOGGER.debug("C4 processing device data")
-            # Extract devices and states
+            # Extract device info only (ID, name) - NOT state (HTTP API state is unreliable)
             self.devices = {device["thing_id"]: device for device in data.get("things", [])}
-            self.states = data.get("states", {})
             
             # Process device data for easier access
+            # HTTP API is only used for device info (ID, name) - NOT for state
+            # All state comes from MQTT which is reliable
             processed_devices = {}
             for device_id, device in self.devices.items():
-                state = self.states.get(device_id, {})
-                device_state = state.get("state", {})
-                
-                # Extract mode value if it's a dictionary (shouldn't happen from API, but be safe)
-                mode_value = device_state.get("mode", 2)
-                if isinstance(mode_value, dict) and "value" in mode_value:
-                    mode_value = mode_value["value"]
+                # Check if we already have state from MQTT for this device
+                existing_state = {}
+                if self.data and device_id in self.data.get("devices", {}):
+                    existing_state = self.data["devices"][device_id].get("state", {})
                 
                 processed_devices[device_id] = {
                     "id": device_id,
                     "name": device.get("user_config", {}).get("name", "AC"),
                     "type": "ac",
-                    "state": {
-                        "power": device_state.get("pow", 0) == 1,
-                        "mode": mode_value,
-                        "temperature": device_state.get("stemp", "24"),
-                        "current_temp": device_state.get("ctemp", "27.5"),
-                        "fan_speed": device_state.get("fspd", 2),
-                        "vertical_swing": device_state.get("vswing", 0),
-                        "horizontal_swing": device_state.get("hswing", 0),
-                        "display": device_state.get("display", 0) != 0,
-                        "esave": device_state.get("esave", 0),
-                        "turbo": device_state.get("turbo", 0),
-                        "sleep": device_state.get("sleep", 0),
-                        "connected": state.get("connected", False),
-                        "rssi": device_state.get("rssi", -45),
-                        "error": device_state.get("err", 0),
-                        "source": device_state.get("src", "unknown"),
-                        "timestamp": state.get("timestamp", 0),
+                    "state": existing_state if existing_state else {
+                        # Default state only used before first MQTT update
+                        "power": False,
+                        "mode": 2,
+                        "temperature": "24",
+                        "current_temp": "27.5",
+                        "fan_speed": 2,
+                        "vertical_swing": 0,
+                        "horizontal_swing": 0,
+                        "display": True,
+                        "esave": 0,
+                        "turbo": 0,
+                        "sleep": 0,
+                        "connected": False,
+                        "rssi": -45,
+                        "error": 0,
+                        "source": "unknown",
+                        "timestamp": 0,
                     },
                     "raw_device": device,
-                    "raw_state": state,
                 }
             
             _LOGGER.debug("C5 coordinator got %d devices: %s", len(processed_devices), str(list(processed_devices.keys()))[:200])
@@ -155,6 +153,7 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning(f"📥 api.control_device returned: {json.dumps(result, indent=2, default=str)}")
             
             # Optimistic update: update local state immediately for instant UI feedback
+            # MQTT will confirm the actual state shortly
             if self.data and device_id in self.data.get("devices", {}):
                 device_data = self.data["devices"][device_id]
                 device_state = device_data["state"]
@@ -272,8 +271,10 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             device_state = device_data["state"]
             
             # Map MQTT payload fields to our state structure
+            # MQTT is reliable - trust it completely for all state
             if "pow" in payload:
                 device_state["power"] = payload["pow"] == 1
+            
             if "mode" in payload:
                 # Extract mode value if it's a dictionary, otherwise use the value directly
                 mode_value = payload["mode"]
