@@ -96,12 +96,15 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             
             if not self._mqtt_subscribed and self.api.mqtt_client:
                 device_ids = list(processed_devices.keys())
+                _LOGGER.warning(f"Subscribing to MQTT for devices: {device_ids}")
                 try:
                     await self.api.subscribe_to_devices(device_ids)
                     self._mqtt_subscribed = True
+                    _LOGGER.warning("Requesting initial device states via MQTT shadow")
                     await self.api.request_device_states(device_ids)
-                    # Give MQTT a moment to receive the shadow response
-                    await asyncio.sleep(0.5)
+                    # Give MQTT time to receive the shadow response
+                    await asyncio.sleep(1.0)
+                    _LOGGER.warning(f"After wait, device state power: {processed_devices.get(device_ids[0], {}).get('state', {}).get('power') if device_ids else 'no devices'}")
                 except Exception as error:
                     _LOGGER.warning(f"Failed to subscribe to MQTT: {error}")
             
@@ -192,7 +195,12 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
     def _handle_mqtt_message(self, device_id: str, payload: Dict[str, Any]) -> None:
         """Handle MQTT state report and update device state."""
         try:
-            if not self.data or device_id not in self.data.get("devices", {}):
+            _LOGGER.warning(f"MQTT message for {device_id}, data exists: {self.data is not None}")
+            if not self.data:
+                _LOGGER.warning(f"MQTT message received but self.data is None")
+                return
+            if device_id not in self.data.get("devices", {}):
+                _LOGGER.warning(f"MQTT message for unknown device: {device_id}, known: {list(self.data.get('devices', {}).keys())}")
                 return
             
             device_state = self.data["devices"][device_id]["state"]
@@ -238,6 +246,7 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             
             device_state["connected"] = True
             
+            _LOGGER.warning(f"Updated state for {device_id}: power={device_state.get('power')}, mode={device_state.get('mode')}, fan={device_state.get('fan_speed')}")
             self.hass.loop.call_soon_threadsafe(self.async_update_listeners)
             
         except Exception as error:

@@ -242,11 +242,13 @@ class BluestarMQTTClient:
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
+            _LOGGER.warning(f"MQTT message on topic: {msg.topic}")
             
             if "state/reported" in msg.topic:
                 parts = msg.topic.split("/")
                 if len(parts) >= 2:
                     device_id = parts[1]
+                    _LOGGER.warning(f"State reported for {device_id}: {payload}")
                     if self.message_callback:
                         self.message_callback(device_id, payload)
             
@@ -254,9 +256,16 @@ class BluestarMQTTClient:
                 parts = msg.topic.split("/")
                 if len(parts) >= 3:
                     device_id = parts[2]
+                    _LOGGER.warning(f"Shadow response for {device_id}: {list(payload.get('state', {}).keys())}")
+                    # Try both "desired" and "reported" state
                     shadow_state = payload.get("state", {}).get("desired", {})
+                    if not shadow_state:
+                        shadow_state = payload.get("state", {}).get("reported", {})
                     if shadow_state and self.message_callback:
+                        _LOGGER.warning(f"Loaded initial state for {device_id}: pow={shadow_state.get('pow')}, mode={shadow_state.get('mode')}")
                         self.message_callback(device_id, shadow_state)
+                    else:
+                        _LOGGER.warning(f"No state found in shadow response: {payload}")
         except Exception as error:
             _LOGGER.warning(f"Error processing MQTT message: {error}")
     
@@ -320,13 +329,18 @@ class BluestarMQTTClient:
     
     async def request_device_state(self, device_id: str) -> bool:
         if not await self.ensure_connected() or not self.client:
+            _LOGGER.warning(f"Cannot request state for {device_id}: not connected")
             return False
         
         try:
             topic = self.PUB_SHADOW_GET_TOPIC % device_id
+            _LOGGER.warning(f"Requesting shadow state for {device_id} on topic: {topic}")
             result = self.client.publish(topic, "", qos=0)
-            return result.rc == mqtt_client.MQTT_ERR_SUCCESS
-        except Exception:
+            success = result.rc == mqtt_client.MQTT_ERR_SUCCESS
+            _LOGGER.warning(f"Shadow request result: {success} (rc={result.rc})")
+            return success
+        except Exception as e:
+            _LOGGER.warning(f"Error requesting shadow state: {e}")
             return False
     
     async def publish(self, device_id: str, control_payload: Dict[str, Any]) -> bool:
