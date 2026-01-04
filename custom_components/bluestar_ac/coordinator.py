@@ -29,6 +29,7 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
         self.devices: Dict[str, Any] = {}
         self.states: Dict[str, Any] = {}
         self._mqtt_subscribed = False
+        self._last_mqtt_client = None  # Track MQTT client instance to detect reinit
 
         super().__init__(
             hass,
@@ -38,8 +39,14 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
         )
         
         # Set up MQTT message callback if MQTT is available
+        self._setup_mqtt_callback()
+
+    def _setup_mqtt_callback(self) -> None:
+        """Set up MQTT message callback on the current MQTT client."""
         if self.api.mqtt_client:
             self.api.mqtt_client.set_message_callback(self._handle_mqtt_message)
+            self._last_mqtt_client = self.api.mqtt_client
+            _LOGGER.debug("📡 MQTT message callback configured")
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via library."""
@@ -49,6 +56,15 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             if not self.api.session_token:
                 _LOGGER.debug("C2 re-logging in to API")
                 await self.api.login()
+                # Re-setup MQTT callback after login creates new client
+                self._setup_mqtt_callback()
+                self._mqtt_subscribed = False  # Force resubscribe after new client
+            
+            # Check if MQTT client changed (due to relogin)
+            if self.api.mqtt_client and self.api.mqtt_client != self._last_mqtt_client:
+                _LOGGER.info("🔄 MQTT client changed, reconfiguring callback...")
+                self._setup_mqtt_callback()
+                self._mqtt_subscribed = False  # Force resubscribe
             
             _LOGGER.debug("C3 fetching devices from API")
             # Get devices and states
@@ -130,6 +146,9 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
             if not self.api.session_token:
                 _LOGGER.warning("🔐 No session token, logging in...")
                 await self.api.login()
+                # Re-setup MQTT callback after login creates new client
+                self._setup_mqtt_callback()
+                self._mqtt_subscribed = False
             
             _LOGGER.warning("📤 Calling api.control_device...")
             result = await self.api.control_device(device_id, control_data)
@@ -147,6 +166,11 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                         # Extract mode value if it's a dictionary, otherwise use the value directly
                         if isinstance(value, dict) and "value" in value:
                             device_state["mode"] = value["value"]
+                            # Also update fan_speed and temperature from mode object
+                            if "fspd" in value:
+                                device_state["fan_speed"] = value["fspd"]
+                            if "stemp" in value:
+                                device_state["temperature"] = str(value["stemp"])
                         else:
                             device_state["mode"] = value
                     elif key == "stemp":
@@ -173,6 +197,8 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
 
     def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
         """Get device data by ID."""
+        if not self.data:
+            return None
         return self.data.get("devices", {}).get(device_id)
 
     def get_device_state(self, device_id: str) -> Optional[Dict[str, Any]]:
@@ -182,6 +208,8 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
 
     def get_all_devices(self) -> Dict[str, Any]:
         """Get all devices."""
+        if not self.data:
+            return {}
         return self.data.get("devices", {})
 
     async def set_mode(self, device_id: str, mode_data: Dict[str, Any]) -> None:
@@ -231,6 +259,10 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
         the update on the Home Assistant event loop.
         """
         try:
+            if not self.data:
+                _LOGGER.debug(f"📥 MQTT message but no data yet: {device_id}")
+                return
+            
             if device_id not in self.data.get("devices", {}):
                 _LOGGER.debug(f"📥 MQTT message for unknown device: {device_id}")
                 return

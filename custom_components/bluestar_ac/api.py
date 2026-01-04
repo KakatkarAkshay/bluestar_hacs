@@ -188,7 +188,11 @@ class BluestarMQTTClient:
         self.message_callback = None  # Callback for handling MQTT messages
         self.subscribed_devices = set()  # Track subscribed device IDs
         self._reconnecting = False  # Flag to prevent multiple simultaneous reconnection attempts
+        self._reconnect_lock = asyncio.Lock()  # Lock for reconnection to prevent races
         self._event_loop = None  # Store event loop for reconnection from callback thread
+        self._connection_attempts = 0  # Track consecutive connection failures
+        self._max_reconnect_attempts = 5  # Max attempts before longer backoff
+        self._last_successful_connect = 0.0  # Timestamp of last successful connection
         
         # Extract region from endpoint (e.g., a26381dl7mudo4-ats.iot.ap-south-1.amazonaws.com -> ap-south-1)
         endpoint = credentials.get("endpoint", "")
@@ -231,6 +235,16 @@ class BluestarMQTTClient:
             access_key = self.credentials["access_key"]
             secret_key = self.credentials["secret_key"]
             session_token = self.credentials.get("session_token")  # May not be present
+            
+            # Clean up any existing client first
+            if self.client:
+                try:
+                    self.client.loop_stop()
+                    self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+                self.is_connected = False
             
             # Create WebSocket URL with SigV4 authentication
             websocket_url = AWSSigV4.create_websocket_url(
@@ -289,33 +303,39 @@ class BluestarMQTTClient:
             await loop.run_in_executor(None, self.client.connect, host, port, 60)
             self.client.loop_start()
             
-            # Wait for connection
-            timeout = 10  # Reduced timeout
-            while not self.is_connected and timeout > 0:
-                await asyncio.sleep(0.5)
-                timeout -= 0.5
+            # Wait for connection with better timeout handling
+            timeout = 15  # Slightly longer timeout
+            poll_interval = 0.25
+            elapsed = 0.0
+            while not self.is_connected and elapsed < timeout:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
             
             if self.is_connected:
                 _LOGGER.info("✅ MQTT Connected successfully via WebSocket")
+                self._connection_attempts = 0  # Reset on success
+                self._last_successful_connect = time.time()
                 return True
             else:
-                _LOGGER.warning("⚠️ MQTT connection timeout")
+                _LOGGER.warning(f"⚠️ MQTT connection timeout after {elapsed:.1f}s")
+                self._connection_attempts += 1
                 # Clean up failed connection
                 try:
                     self.client.loop_stop()
                     self.client.disconnect()
-                except:
+                except Exception:
                     pass
                 return False
                 
         except Exception as error:
             _LOGGER.warning(f"⚠️ MQTT connection failed: {error}")
+            self._connection_attempts += 1
             # Don't log full traceback for MQTT failures - it's expected to fail sometimes
             try:
                 if self.client:
                     self.client.loop_stop()
                     self.client.disconnect()
-            except:
+            except Exception:
                 pass
             return False
     
@@ -330,27 +350,27 @@ class BluestarMQTTClient:
     
     def _on_disconnect(self, client, userdata, rc):
         """Handle MQTT disconnection."""
+        was_connected = self.is_connected
         self.is_connected = False
-        _LOGGER.info("📴 MQTT Disconnected")
-        # Trigger immediate reconnection if not already reconnecting
-        if not self._reconnecting and rc != 0:
-            # rc != 0 means unexpected disconnect, rc == 0 means intentional
-            _LOGGER.info("🔄 MQTT unexpected disconnect, attempting immediate reconnection...")
-            self._schedule_reconnect()
+        
+        if rc == 0:
+            _LOGGER.info("📴 MQTT Disconnected (intentional)")
+        else:
+            _LOGGER.warning(f"📴 MQTT Disconnected unexpectedly (rc={rc})")
+            # Only attempt reconnection if we were previously connected and it's an unexpected disconnect
+            if was_connected and not self._reconnecting:
+                _LOGGER.info("🔄 Scheduling MQTT reconnection...")
+                self._schedule_reconnect()
     
     def _on_error(self, client, userdata, error):
         """Handle MQTT errors."""
         _LOGGER.error(f"❌ MQTT Error: {error}")
-        self.is_connected = False
-        # Trigger immediate reconnection
-        if not self._reconnecting:
-            _LOGGER.info("🔄 MQTT error occurred, attempting immediate reconnection...")
-            self._schedule_reconnect()
+        # Don't set is_connected to False here - let _on_disconnect handle it
+        # This prevents duplicate reconnection attempts
     
     def _on_message(self, client, userdata, msg):
         """Handle MQTT messages."""
         try:
-            import json
             payload = json.loads(msg.payload.decode())
             
             # Check if this is a device state report
@@ -375,6 +395,7 @@ class BluestarMQTTClient:
     def _schedule_reconnect(self):
         """Schedule reconnection from MQTT callback thread."""
         if self._reconnecting:
+            _LOGGER.debug("Reconnection already scheduled, skipping")
             return
         
         # Try to get event loop
@@ -383,72 +404,77 @@ class BluestarMQTTClient:
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
-                _LOGGER.warning("⚠️ No event loop available for immediate reconnection, will retry on next operation")
+                _LOGGER.warning("⚠️ No event loop available for reconnection, will retry on next operation")
                 return
         
         # Schedule reconnection task from callback thread
         if loop.is_running():
             loop.call_soon_threadsafe(self._start_reconnect_task, loop)
         else:
-            # If loop is not running, try to run the reconnection
-            try:
-                loop.run_until_complete(self._reconnect())
-            except Exception as e:
-                _LOGGER.warning(f"⚠️ Could not reconnect immediately: {e}, will retry on next operation")
+            _LOGGER.warning("⚠️ Event loop not running, will retry on next operation")
     
     def _start_reconnect_task(self, loop):
         """Start reconnection task from event loop thread."""
         if not self._reconnecting:
-            asyncio.create_task(self._reconnect())
+            asyncio.create_task(self._reconnect_with_backoff())
     
-    async def _reconnect(self) -> bool:
-        """Attempt to reconnect to MQTT broker."""
-        if self._reconnecting:
-            _LOGGER.debug("Reconnection already in progress, skipping")
-            return False
-        
-        self._reconnecting = True
-        try:
-            _LOGGER.info("🔄 Attempting to reconnect to MQTT broker...")
+    async def _reconnect_with_backoff(self) -> bool:
+        """Attempt to reconnect with exponential backoff."""
+        async with self._reconnect_lock:
+            if self._reconnecting:
+                _LOGGER.debug("Reconnection already in progress, skipping")
+                return self.is_connected
             
-            # Clean up existing connection
-            if self.client:
-                try:
-                    self.client.loop_stop()
-                    self.client.disconnect()
-                except:
-                    pass
+            if self.is_connected:
+                _LOGGER.debug("Already connected, skipping reconnection")
+                return True
             
-            # Attempt to reconnect
-            success = await self.connect()
+            self._reconnecting = True
             
-            if success:
-                # Resubscribe to all devices
-                for device_id in list(self.subscribed_devices):
-                    await self.subscribe_to_device(device_id)
-                _LOGGER.info("✅ MQTT reconnected and resubscribed to devices")
-            else:
-                _LOGGER.warning("⚠️ MQTT reconnection failed")
-            
-            return success
-        finally:
-            self._reconnecting = False
+            try:
+                # Calculate backoff delay based on attempts
+                if self._connection_attempts >= self._max_reconnect_attempts:
+                    # Long backoff after many failures
+                    backoff_delay = min(60, 5 * (2 ** (self._connection_attempts - self._max_reconnect_attempts)))
+                else:
+                    # Short exponential backoff
+                    backoff_delay = min(30, 1 * (2 ** self._connection_attempts))
+                
+                if self._connection_attempts > 0:
+                    _LOGGER.info(f"🔄 Reconnecting to MQTT in {backoff_delay:.1f}s (attempt {self._connection_attempts + 1})...")
+                    await asyncio.sleep(backoff_delay)
+                else:
+                    _LOGGER.info("🔄 Attempting to reconnect to MQTT broker...")
+                
+                # Check if we were connected while waiting
+                if self.is_connected:
+                    return True
+                
+                # Attempt to reconnect
+                success = await self.connect()
+                
+                if success:
+                    # Resubscribe to all devices
+                    for device_id in list(self.subscribed_devices):
+                        try:
+                            await self.subscribe_to_device(device_id)
+                        except Exception as e:
+                            _LOGGER.warning(f"⚠️ Failed to resubscribe to {device_id}: {e}")
+                    _LOGGER.info("✅ MQTT reconnected and resubscribed to devices")
+                else:
+                    _LOGGER.warning(f"⚠️ MQTT reconnection failed (attempt {self._connection_attempts})")
+                
+                return success
+            finally:
+                self._reconnecting = False
     
     async def ensure_connected(self) -> bool:
         """Ensure MQTT is connected, reconnect if necessary."""
         if self.is_connected:
             return True
         
-        if not self._reconnecting:
-            return await self._reconnect()
-        
-        # Wait for reconnection to complete
-        timeout = 10
-        while self._reconnecting and timeout > 0:
-            await asyncio.sleep(0.5)
-            timeout -= 0.5
-        
-        return self.is_connected
+        _LOGGER.info("📡 MQTT not connected, attempting reconnection...")
+        return await self._reconnect_with_backoff()
     
     async def subscribe_to_device(self, device_id: str) -> bool:
         """Subscribe to device state reports."""

@@ -1,6 +1,10 @@
-"""Climate platform for Bluestar AC."""
+"""Climate platform for Bluestar Smart AC integration."""
+
+from __future__ import annotations
+
+import json
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -13,357 +17,446 @@ from homeassistant.const import (
     CONF_DEVICE_ID,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DOMAIN,
+    MANUFACTURER,
+    MODEL,
     MIN_TEMP,
     MAX_TEMP,
-    DEFAULT_TEMPERATURE,
+    FAN_MODES,
 )
 from .coordinator import BluestarDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Mode mapping from Bluestar API to Home Assistant
-# AC only supports: Fan (0), Cool (2), Dry (3), Auto (4)
-BLUESTAR_TO_HA_MODE = {
-    0: HVACMode.FAN_ONLY,  # Fan
-    2: HVACMode.COOL,       # Cool
-    3: HVACMode.DRY,        # Dry
-    4: HVACMode.AUTO,       # Auto
-}
-
-HA_TO_BLUESTAR_MODE = {
-    HVACMode.FAN_ONLY: 0,
+# Map HVAC modes to Bluestar mode values
+HVAC_MODE_TO_BLUESTAR = {
+    HVACMode.AUTO: 0,
     HVACMode.COOL: 2,
     HVACMode.DRY: 3,
-    HVACMode.AUTO: 4,
+    HVACMode.FAN_ONLY: 4,
 }
 
-# Fan speed mapping
-BLUESTAR_TO_HA_FAN = {
+# Map Bluestar mode values to HVAC modes
+BLUESTAR_TO_HVAC_MODE = {
+    0: HVACMode.AUTO,
+    2: HVACMode.COOL,
+    3: HVACMode.DRY,
+    4: HVACMode.FAN_ONLY,
+}
+
+# Map fan modes to Bluestar values
+FAN_MODE_TO_BLUESTAR = {
+    "auto": 0,
+    "low": 2,
+    "medium": 3,
+    "high": 5,
+}
+
+# Map Bluestar values to fan modes
+BLUESTAR_TO_FAN_MODE = {
+    0: "auto",
     2: "low",
     3: "medium",
-    4: "high",
-    6: "turbo",
-    7: "auto",
+    5: "high",
 }
 
-HA_TO_BLUESTAR_FAN = {v: k for k, v in BLUESTAR_TO_HA_FAN.items()}
+# Default fan speed and temperature per mode
+DEFAULT_MODE_SETTINGS = {
+    HVACMode.AUTO: {"fan_speed": 0, "temperature": 24.0},    # auto fan
+    HVACMode.COOL: {"fan_speed": 3, "temperature": 24.0},    # medium fan
+    HVACMode.DRY: {"fan_speed": 2, "temperature": 24.0},     # low fan
+    HVACMode.FAN_ONLY: {"fan_speed": 3, "temperature": 24.0}, # medium fan
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Bluestar AC climate platform."""
-    coordinator: BluestarDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
-    device_id = config_entry.data[CONF_DEVICE_ID]
-    _LOGGER.info(f"Setting up climate entity for device: {device_id}")
+    """Set up Bluestar AC climate entities."""
+    coordinator: BluestarDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    device_id = entry.data[CONF_DEVICE_ID]
     
-    entity = BluestarACClimate(coordinator, device_id)
-    async_add_entities([entity], True)
+    device = coordinator.get_device(device_id)
+    if device:
+        async_add_entities([BluestarClimateEntity(coordinator, device_id, entry)])
+        _LOGGER.info(f"✅ Added climate entity for device: {device_id}")
+    else:
+        _LOGGER.error(f"❌ Device {device_id} not found in coordinator data")
 
-class BluestarACClimate(CoordinatorEntity, ClimateEntity):
-    """Representation of a Bluestar AC climate entity."""
-    
-    def __init__(self, coordinator: BluestarDataUpdateCoordinator, device_id: str):
+
+class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
+    """Bluestar AC climate entity."""
+
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_target_temperature_step = 1.0
+    _attr_min_temp = MIN_TEMP
+    _attr_max_temp = MAX_TEMP
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.AUTO, HVACMode.COOL, HVACMode.DRY, HVACMode.FAN_ONLY]
+    _attr_fan_modes = FAN_MODES
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.FAN_MODE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
+
+    def __init__(
+        self,
+        coordinator: BluestarDataUpdateCoordinator,
+        device_id: str,
+        entry: ConfigEntry,
+    ) -> None:
         """Initialize the climate entity."""
         super().__init__(coordinator)
         self._device_id = device_id
-        self._attr_unique_id = f"bluestar_ac_{device_id}"
-        self._previous_temperature: Optional[float] = None
-        self._previous_fan_mode: Optional[int] = None
+        self._entry = entry
+        self._attr_unique_id = f"{device_id}_climate"
         
-        # Set supported features
-        self._attr_supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE |
-            ClimateEntityFeature.FAN_MODE |
-            ClimateEntityFeature.SWING_MODE |
-            ClimateEntityFeature.PRESET_MODE
-        )
+        # Get device info
+        device = coordinator.get_device(device_id)
+        device_name = device.get("name", "AC") if device else "AC"
         
-        # Set temperature unit and step
-        self._attr_temperature_unit = UnitOfTemperature.CELSIUS
-        self._attr_min_temp = MIN_TEMP
-        self._attr_max_temp = MAX_TEMP
-        self._attr_target_temperature_step = 1
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, device_id)},
+            "name": device_name,
+            "manufacturer": MANUFACTURER,
+            "model": MODEL,
+        }
         
-        # Set available modes (only Off and Cool)
-        self._attr_hvac_modes = [
-            HVACMode.OFF,
-            HVACMode.FAN_ONLY,
-            HVACMode.COOL,
-            HVACMode.DRY,
-            HVACMode.AUTO,
-        ]
-        self._attr_fan_modes = ["auto", "low", "medium", "high", "turbo"]
-        self._attr_swing_modes = ["off", "horizontal", "vertical", "both"]
-        self._attr_preset_modes = ["none", "eco", "turbo", "sleep"]
+        # Local state storage - persisted across restarts
+        # Stores fan_speed and temperature per HVAC mode
+        self._mode_settings: dict[str, dict[str, Any]] = {}
         
+        # Current locally tracked state (used when MQTT state is stale/unavailable)
+        self._local_power: bool | None = None
+        self._local_mode: int | None = None
+        self._local_fan_speed: int | None = None
+        self._local_temperature: float | None = None
+        
+        # Last known mode before turning off (to restore on turn_on)
+        self._last_active_mode: HVACMode = HVACMode.COOL
+        
+        _LOGGER.info(f"🌡️ Created climate entity for {device_name} ({device_id})")
+
+    async def async_added_to_hass(self) -> None:
+        """Handle entity which will be added."""
+        await super().async_added_to_hass()
+        
+        # Restore previous state
+        if (last_state := await self.async_get_last_state()) is not None:
+            _LOGGER.info(f"🔄 Restoring state for {self._device_id}: {last_state.state}")
+            
+            # Restore mode settings from attributes
+            if last_state.attributes:
+                attrs = last_state.attributes
+                
+                # Restore per-mode settings
+                if "mode_settings" in attrs:
+                    try:
+                        self._mode_settings = attrs["mode_settings"]
+                        _LOGGER.info(f"📦 Restored mode settings: {self._mode_settings}")
+                    except Exception as e:
+                        _LOGGER.warning(f"⚠️ Could not restore mode settings: {e}")
+                
+                # Restore last active mode
+                if "last_active_mode" in attrs:
+                    try:
+                        self._last_active_mode = HVACMode(attrs["last_active_mode"])
+                    except ValueError:
+                        self._last_active_mode = HVACMode.COOL
+                
+                # Restore local state
+                if "local_fan_speed" in attrs:
+                    self._local_fan_speed = attrs["local_fan_speed"]
+                if "local_temperature" in attrs:
+                    self._local_temperature = attrs["local_temperature"]
+        
+        # Initialize mode settings with defaults if not restored
+        for mode in [HVACMode.AUTO, HVACMode.COOL, HVACMode.DRY, HVACMode.FAN_ONLY]:
+            if mode.value not in self._mode_settings:
+                defaults = DEFAULT_MODE_SETTINGS.get(mode, {"fan_speed": 3, "temperature": 24.0})
+                self._mode_settings[mode.value] = defaults.copy()
+        
+        # Sync local state with device state
+        self._sync_local_state_from_device()
+
+    def _sync_local_state_from_device(self) -> None:
+        """Sync local state from device state."""
+        state = self._get_device_state()
+        if state:
+            # Update local state from device
+            if self._local_power is None:
+                self._local_power = state.get("power", False)
+            if self._local_mode is None:
+                self._local_mode = state.get("mode", 2)
+            if self._local_fan_speed is None:
+                self._local_fan_speed = state.get("fan_speed", 3)
+            if self._local_temperature is None:
+                temp = state.get("temperature", "24")
+                try:
+                    self._local_temperature = float(temp)
+                except (ValueError, TypeError):
+                    self._local_temperature = 24.0
+
     @property
-    def device_info(self):
-        """Return device information."""
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return extra state attributes for persistence."""
+        return {
+            "mode_settings": self._mode_settings,
+            "last_active_mode": self._last_active_mode.value if self._last_active_mode else HVACMode.COOL.value,
+            "local_fan_speed": self._local_fan_speed,
+            "local_temperature": self._local_temperature,
+            "device_id": self._device_id,
+        }
+
+    def _get_device_state(self) -> dict[str, Any] | None:
+        """Get current device state from coordinator."""
         device = self.coordinator.get_device(self._device_id)
-        if device:
-            return {
-                "identifiers": {(DOMAIN, self._device_id)},
-                "name": device.get("name", f"Bluestar AC {self._device_id}"),
-                "manufacturer": "Bluestar",
-                "model": "Smart AC",
-            }
-        return None
-    
-    @property
-    def name(self) -> str:
-        """Return the name of the entity."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            return device.get("name", f"Bluestar AC {self._device_id}")
-        return f"Bluestar AC {self._device_id}"
-    
+        return device.get("state") if device else None
+
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
-        if not self.coordinator.data:
+        """Return if entity is available."""
+        device = self.coordinator.get_device(self._device_id)
+        if not device:
             return False
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            return device.get("state", {}).get("connected", False)
-        return False
-    
-    @property
-    def current_temperature(self) -> Optional[float]:
-        """Return the current temperature."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            current_temp = state.get("current_temp")
-            if current_temp:
-                try:
-                    return float(current_temp)
-                except (ValueError, TypeError):
-                    pass
-        return None
-    
-    @property
-    def target_temperature(self) -> Optional[float]:
-        """Return the target temperature."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            target_temp = state.get("temperature")
-            if target_temp:
-                try:
-                    return float(target_temp)
-                except (ValueError, TypeError):
-                    pass
-        return DEFAULT_TEMPERATURE
-    
+        state = device.get("state", {})
+        return state.get("connected", False)
+
     @property
     def hvac_mode(self) -> HVACMode:
         """Return current HVAC mode."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            power = state.get("power", False)
-            if not power:
-                return HVACMode.OFF
-            mode = state.get("mode", 2)
-            # Extract mode value if it's a dictionary, otherwise use the value directly
-            if isinstance(mode, dict) and "value" in mode:
-                mode = mode["value"]
-            return BLUESTAR_TO_HA_MODE.get(mode, HVACMode.COOL)
-        return HVACMode.OFF
-    
+        state = self._get_device_state()
+        if not state:
+            return HVACMode.OFF
+        
+        power = state.get("power", False)
+        if not power:
+            return HVACMode.OFF
+        
+        mode = state.get("mode", 2)
+        return BLUESTAR_TO_HVAC_MODE.get(mode, HVACMode.COOL)
+
     @property
-    def fan_mode(self) -> Optional[str]:
+    def current_temperature(self) -> float | None:
+        """Return current temperature."""
+        state = self._get_device_state()
+        if not state:
+            return None
+        
+        current_temp = state.get("current_temp", "27.5")
+        try:
+            return float(current_temp)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def target_temperature(self) -> float | None:
+        """Return target temperature."""
+        state = self._get_device_state()
+        if not state:
+            return self._local_temperature or 24.0
+        
+        temp = state.get("temperature", "24")
+        try:
+            device_temp = float(temp)
+            # Update local state
+            self._local_temperature = device_temp
+            return device_temp
+        except (ValueError, TypeError):
+            return self._local_temperature or 24.0
+
+    @property
+    def fan_mode(self) -> str | None:
         """Return current fan mode."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            fan_speed = state.get("fan_speed", 7)
-            return BLUESTAR_TO_HA_FAN.get(fan_speed, "auto")
-        return "auto"
-    
-    @property
-    def swing_mode(self) -> Optional[str]:
-        """Return current swing mode."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            hswing = state.get("horizontal_swing", 1)
-            vswing = state.get("vertical_swing", 1)
-            # Device uses inverted values: 0=ON, 1=OFF
-            hswing_on = hswing == 0
-            vswing_on = vswing == 0
-            if hswing_on and vswing_on:
-                return "both"
-            elif hswing_on:
-                return "horizontal"
-            elif vswing_on:
-                return "vertical"
-        return "off"
-    
-    @property
-    def preset_mode(self) -> Optional[str]:
-        """Return current preset mode."""
-        device = self.coordinator.get_device(self._device_id)
-        if device:
-            state = device.get("state", {})
-            turbo = state.get("turbo", 0)
-            esave = state.get("esave", 0)
-            sleep = state.get("sleep", 0)
-            
-            if turbo == 3:
-                return "turbo"
-            elif esave == 1:
-                return "eco"
-            elif sleep == 1:
-                return "sleep"
-        return "none"
-    
-    async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
-        _LOGGER.warning(f"🌡️ Setting temperature: {kwargs}")
-        try:
-            if ATTR_TEMPERATURE in kwargs:
-                temperature = round(kwargs[ATTR_TEMPERATURE])
-                await self.coordinator.set_temperature(self._device_id, temperature)
-        except Exception as e:
-            _LOGGER.error(f"❌ set_temperature failed: {e}", exc_info=True)
-            raise
-    
+        state = self._get_device_state()
+        if not state:
+            return BLUESTAR_TO_FAN_MODE.get(self._local_fan_speed, "medium")
+        
+        fan_speed = state.get("fan_speed", 3)
+        # Update local state
+        self._local_fan_speed = fan_speed
+        return BLUESTAR_TO_FAN_MODE.get(fan_speed, "medium")
+
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set new target hvac mode."""
+        """Set HVAC mode."""
         _LOGGER.warning(f"❄️ Setting HVAC mode: {hvac_mode}")
-        try:
-            if hvac_mode == HVACMode.OFF:
-                await self.coordinator.set_power(self._device_id, False)
-            else:
-                # Get current state to include fan speed and temperature
-                device = self.coordinator.get_device(self._device_id)
-                current_fan_speed = 7  # Default to auto
-                current_temp = DEFAULT_TEMPERATURE
-                
-                if device:
-                    state = device.get("state", {})
-                    current_fan_speed = state.get("fan_speed", 7)
-                    temp_str = state.get("temperature", str(DEFAULT_TEMPERATURE))
-                    try:
-                        current_temp = float(temp_str)
-                    except (ValueError, TypeError):
-                        current_temp = DEFAULT_TEMPERATURE
-                
-                bluestar_mode = HA_TO_BLUESTAR_MODE.get(hvac_mode, 2)
-                
-                # Format mode as object with value, fspd, and stemp
-                # Based on actual MQTT protocol: {"mode": {"value": 2, "stemp": "24.0", "fspd": 7}}
-                # Cool mode (2) requires stemp and fspd
-                mode_obj = {
-                    "value": bluestar_mode,
-                    "fspd": current_fan_speed  # Always use current fan speed
-                }
-                
-                # Include temperature for modes that need it (Cool=2, Dry=3, Auto=4)
-                # Fan mode (0) doesn't need temperature
-                if bluestar_mode in [2, 3, 4]:  # Cool, Dry, Auto
-                    mode_obj["stemp"] = f"{current_temp:.1f}"  # Format as XX.X
-                
-                control_data = {
-                    "pow": 1,
-                    "mode": mode_obj
-                }
-                
-                _LOGGER.warning(f"📤 Mode control data: {control_data}")
-                await self.coordinator.control_device(self._device_id, control_data)
-        except Exception as e:
-            _LOGGER.error(f"❌ set_hvac_mode failed: {e}", exc_info=True)
-            raise
-    
-    async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Set new target fan mode."""
-        _LOGGER.warning(f"🌀 Setting fan mode: {fan_mode}")
-        try:
-            bluestar_fan = HA_TO_BLUESTAR_FAN.get(fan_mode, 7)
-            await self.coordinator.set_fan_mode(self._device_id, bluestar_fan)
-        except Exception as e:
-            _LOGGER.error(f"❌ set_fan_mode failed: {e}", exc_info=True)
-            raise
-    
-    async def async_set_swing_mode(self, swing_mode: str) -> None:
-        """Set new target swing mode."""
-        _LOGGER.warning(f"🔄 Setting swing mode: {swing_mode}")
-        try:
-            # Device uses inverted values: 0=ON, 1=OFF
-            control_data = {}
-            if swing_mode == "off":
-                control_data = {"hswing": 1, "vswing": 1}
-            elif swing_mode == "horizontal":
-                control_data = {"hswing": 0, "vswing": 1}
-            elif swing_mode == "vertical":
-                control_data = {"hswing": 1, "vswing": 0}
-            elif swing_mode == "both":
-                control_data = {"hswing": 0, "vswing": 0}
+        
+        if hvac_mode == HVACMode.OFF:
+            # Turn off - just send power off
+            await self.coordinator.set_power(self._device_id, False)
+            self._local_power = False
+        else:
+            # Save current mode settings before switching
+            current_hvac_mode = self.hvac_mode
+            if current_hvac_mode != HVACMode.OFF:
+                self._save_current_mode_settings(current_hvac_mode)
+                self._last_active_mode = current_hvac_mode
             
-            if control_data:
-                await self.coordinator.control_device(self._device_id, control_data)
-        except Exception as e:
-            _LOGGER.error(f"❌ set_swing_mode failed: {e}", exc_info=True)
-            raise
-    
-    async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Set new preset mode."""
-        _LOGGER.warning(f"🎯 Setting preset mode: {preset_mode}")
-        try:
-            control_data = {
-                "esave": 0,
-                "turbo": 0,
-                "sleep": 0,
+            # Get saved settings for the new mode
+            mode_settings = self._get_mode_settings(hvac_mode)
+            fan_speed = mode_settings.get("fan_speed", self._local_fan_speed or 3)
+            temperature = mode_settings.get("temperature", self._local_temperature or 24.0)
+            
+            # Build mode payload - KEEP THIS EXACT FORMAT AS REQUIRED
+            bluestar_mode = HVAC_MODE_TO_BLUESTAR.get(hvac_mode, 2)
+            mode_data = {
+                "pow": 1,
+                "mode": {
+                    "value": bluestar_mode,
+                    "fspd": fan_speed,
+                    "stemp": f"{float(temperature):.1f}",
+                }
             }
             
-            current_preset = self.preset_mode
+            _LOGGER.warning(f"📤 Mode control data: {mode_data}")
             
-            if preset_mode in ["eco", "turbo"]:
-                if current_preset == "none" or current_preset is None:
-                    device = self.coordinator.get_device(self._device_id)
-                    if device:
-                        state = device.get("state", {})
-                        current_temp = state.get("temperature")
-                        current_fan = state.get("fan_speed", 7)
-                        
-                        if current_temp:
-                            try:
-                                self._previous_temperature = float(current_temp)
-                            except (ValueError, TypeError):
-                                pass
-                        self._previous_fan_mode = current_fan
-                        _LOGGER.warning(f"🎯 Stored previous temperature: {self._previous_temperature}, fan_mode: {self._previous_fan_mode}")
+            await self.coordinator.control_device(self._device_id, mode_data)
             
-            if preset_mode == "eco":
-                control_data["esave"] = 1
-            elif preset_mode == "turbo":
-                control_data["turbo"] = 3
-            elif preset_mode == "sleep":
-                control_data["sleep"] = 1
-            elif preset_mode == "none":
-                if self._previous_temperature is not None:
-                    control_data["stemp"] = f"{self._previous_temperature:.1f}"
-                    _LOGGER.warning(f"🎯 Restoring previous temperature: {self._previous_temperature}")
-                    self._previous_temperature = None
-                if self._previous_fan_mode is not None:
-                    control_data["fspd"] = self._previous_fan_mode
-                    _LOGGER.warning(f"🎯 Restoring previous fan_mode: {self._previous_fan_mode}")
-                    self._previous_fan_mode = None
+            # Update local state
+            self._local_power = True
+            self._local_mode = bluestar_mode
+            self._local_fan_speed = fan_speed
+            self._local_temperature = temperature
+            self._last_active_mode = hvac_mode
+        
+        self.async_write_ha_state()
+
+    async def async_turn_on(self) -> None:
+        """Turn on the AC."""
+        _LOGGER.warning(f"🔌 Turning ON AC - restoring mode: {self._last_active_mode}")
+        
+        # Turn on with last active mode
+        await self.async_set_hvac_mode(self._last_active_mode or HVACMode.COOL)
+
+    async def async_turn_off(self) -> None:
+        """Turn off the AC."""
+        _LOGGER.warning(f"🔌 Turning OFF AC")
+        
+        # Save current settings before turning off
+        current_mode = self.hvac_mode
+        if current_mode != HVACMode.OFF:
+            self._save_current_mode_settings(current_mode)
+            self._last_active_mode = current_mode
+        
+        await self.async_set_hvac_mode(HVACMode.OFF)
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Set target temperature."""
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+        if temperature is None:
+            return
+        
+        _LOGGER.warning(f"🌡️ Setting temperature: {temperature}")
+        
+        await self.coordinator.set_temperature(self._device_id, temperature)
+        
+        # Update local state
+        self._local_temperature = float(temperature)
+        
+        # Save to current mode settings
+        current_mode = self.hvac_mode
+        if current_mode != HVACMode.OFF:
+            if current_mode.value not in self._mode_settings:
+                self._mode_settings[current_mode.value] = {}
+            self._mode_settings[current_mode.value]["temperature"] = float(temperature)
+        
+        self.async_write_ha_state()
+
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """Set fan mode."""
+        _LOGGER.warning(f"🌀 Setting fan mode: {fan_mode}")
+        
+        bluestar_fan = FAN_MODE_TO_BLUESTAR.get(fan_mode, 3)
+        await self.coordinator.set_fan_mode(self._device_id, bluestar_fan)
+        
+        # Update local state
+        self._local_fan_speed = bluestar_fan
+        
+        # Save to current mode settings
+        current_mode = self.hvac_mode
+        if current_mode != HVACMode.OFF:
+            if current_mode.value not in self._mode_settings:
+                self._mode_settings[current_mode.value] = {}
+            self._mode_settings[current_mode.value]["fan_speed"] = bluestar_fan
+        
+        self.async_write_ha_state()
+
+    def _save_current_mode_settings(self, hvac_mode: HVACMode) -> None:
+        """Save current fan speed and temperature for the given mode."""
+        if hvac_mode == HVACMode.OFF:
+            return
+        
+        state = self._get_device_state()
+        if not state:
+            return
+        
+        fan_speed = self._local_fan_speed or state.get("fan_speed", 3)
+        temp = self._local_temperature
+        if temp is None:
+            try:
+                temp = float(state.get("temperature", "24"))
+            except (ValueError, TypeError):
+                temp = 24.0
+        
+        if hvac_mode.value not in self._mode_settings:
+            self._mode_settings[hvac_mode.value] = {}
+        
+        self._mode_settings[hvac_mode.value]["fan_speed"] = fan_speed
+        self._mode_settings[hvac_mode.value]["temperature"] = temp
+        
+        _LOGGER.debug(f"💾 Saved settings for {hvac_mode}: fan={fan_speed}, temp={temp}")
+
+    def _get_mode_settings(self, hvac_mode: HVACMode) -> dict[str, Any]:
+        """Get saved settings for a mode, or defaults."""
+        if hvac_mode.value in self._mode_settings:
+            return self._mode_settings[hvac_mode.value]
+        
+        # Return defaults
+        defaults = DEFAULT_MODE_SETTINGS.get(hvac_mode, {"fan_speed": 3, "temperature": 24.0})
+        return defaults.copy()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        # Sync local state from device when we get updates
+        state = self._get_device_state()
+        if state:
+            # Update local tracking with device state
+            device_power = state.get("power", False)
+            device_mode = state.get("mode", 2)
+            device_fan = state.get("fan_speed", 3)
+            
+            try:
+                device_temp = float(state.get("temperature", "24"))
+            except (ValueError, TypeError):
+                device_temp = 24.0
+            
+            # Only update if device reports it's on (to avoid stale state)
+            if device_power:
+                self._local_power = True
+                self._local_mode = device_mode
+                self._local_fan_speed = device_fan
+                self._local_temperature = device_temp
+                
+                # Update mode settings with current values
+                hvac_mode = BLUESTAR_TO_HVAC_MODE.get(device_mode, HVACMode.COOL)
+                if hvac_mode.value not in self._mode_settings:
+                    self._mode_settings[hvac_mode.value] = {}
+                self._mode_settings[hvac_mode.value]["fan_speed"] = device_fan
+                self._mode_settings[hvac_mode.value]["temperature"] = device_temp
             else:
-                _LOGGER.warning(f"⚠️ Unknown preset mode: {preset_mode}")
-                return
-            
-            await self.coordinator.control_device(self._device_id, control_data)
-        except Exception as e:
-            _LOGGER.error(f"❌ set_preset_mode failed: {e}", exc_info=True)
-            raise
-    
+                self._local_power = False
+        
+        self.async_write_ha_state()
+
