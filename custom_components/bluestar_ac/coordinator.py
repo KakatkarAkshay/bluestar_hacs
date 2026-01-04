@@ -1,5 +1,6 @@
 """Data update coordinator for Bluestar Smart AC integration."""
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any, Dict, Optional
@@ -89,16 +90,22 @@ class BluestarDataUpdateCoordinator(DataUpdateCoordinator):
                     "raw_device": device,
                 }
             
+            # Update self.data BEFORE requesting MQTT states so the callback can update it
+            result = {"devices": processed_devices}
+            self.data = result
+            
             if not self._mqtt_subscribed and self.api.mqtt_client:
                 device_ids = list(processed_devices.keys())
                 try:
                     await self.api.subscribe_to_devices(device_ids)
                     self._mqtt_subscribed = True
                     await self.api.request_device_states(device_ids)
+                    # Give MQTT a moment to receive the shadow response
+                    await asyncio.sleep(0.5)
                 except Exception as error:
                     _LOGGER.warning(f"Failed to subscribe to MQTT: {error}")
             
-            return {"devices": processed_devices}
+            return result
 
         except BluestarAPIError as err:
             raise UpdateFailed(f"Error communicating with Bluestar API: {err}")
