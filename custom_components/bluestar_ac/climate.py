@@ -244,11 +244,17 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         """Return current fan mode."""
         state = self._get_device_state()
         if not state:
-            return BLUESTAR_TO_FAN_MODE.get(self._local_fan_speed, "medium")
+            fan_mode = BLUESTAR_TO_FAN_MODE.get(self._local_fan_speed, "auto")
+        else:
+            fan_speed = state.get("fan_speed", 3)
+            self._local_fan_speed = fan_speed
+            fan_mode = BLUESTAR_TO_FAN_MODE.get(fan_speed, "auto")
         
-        fan_speed = state.get("fan_speed", 3)
-        self._local_fan_speed = fan_speed
-        return BLUESTAR_TO_FAN_MODE.get(fan_speed, "medium")
+        # Ensure returned fan mode is valid for current HVAC mode
+        valid_modes = self.fan_modes
+        if fan_mode not in valid_modes:
+            return valid_modes[0] if valid_modes else "auto"
+        return fan_mode
 
     @property
     def swing_mode(self) -> str | None:
