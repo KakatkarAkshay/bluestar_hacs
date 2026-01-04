@@ -48,14 +48,8 @@ TEMP_ALLOWED_MODES = {HVACMode.AUTO, HVACMode.COOL, HVACMode.DRY}
 # Fan modes available in FAN_ONLY mode (no auto)
 FAN_ONLY_FAN_MODES = ["low", "medium", "high", "turbo"]
 
-# Swing modes (combined horizontal + vertical oscillation)
+# Swing modes
 SWING_MODES = ["off", "vertical", "horizontal", "both"]
-
-# Vertical swing positions (when not oscillating)
-# vswing=0 means oscillating, vswing=1-5 are fixed positions
-VERTICAL_SWING_POSITIONS = ["position_1", "position_2", "position_3", "position_4", "position_5"]
-VSWING_POSITION_TO_VALUE = {"position_1": 1, "position_2": 2, "position_3": 3, "position_4": 4, "position_5": 5}
-VSWING_VALUE_TO_POSITION = {v: k for k, v in VSWING_POSITION_TO_VALUE.items()}
 
 # Preset modes
 PRESET_MODES = ["none", "eco", "turbo", "sleep"]
@@ -200,10 +194,6 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
             features |= ClimateEntityFeature.TARGET_TEMPERATURE
         if current_mode in FAN_SPEED_ALLOWED_MODES:
             features |= ClimateEntityFeature.FAN_MODE
-        # Show vertical swing position dropdown when swing is off or horizontal only
-        current_swing = self.swing_mode
-        if current_swing in ["off", "horizontal"]:
-            features |= ClimateEntityFeature.SWING_VERTICAL
         return features
 
     @property
@@ -281,28 +271,6 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         elif vswing_on:
             return "vertical"
         return "off"
-
-    @property
-    def swing_vertical_mode(self) -> str | None:
-        """Return current vertical swing position (when not oscillating)."""
-        state = self._get_device_state()
-        if not state:
-            return "position_1"
-        
-        vswing = state.get("vertical_swing", 1)
-        # vswing=0 means oscillating, vswing=1-5 are positions
-        if vswing == 0:
-            return None  # Oscillating, no fixed position
-        return VSWING_VALUE_TO_POSITION.get(vswing, "position_1")
-
-    @property
-    def swing_vertical_modes(self) -> list[str] | None:
-        """Return available vertical swing positions."""
-        # Only show positions when vertical swing is not oscillating
-        current_swing = self.swing_mode
-        if current_swing in ["off", "horizontal"]:
-            return VERTICAL_SWING_POSITIONS
-        return None
 
     @property
     def preset_mode(self) -> str | None:
@@ -418,36 +386,21 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
-        """Set swing mode (combined horizontal + vertical oscillation)."""
+        """Set swing mode."""
         # hswing: 0=oscillating, 1=off
-        # vswing: 0=oscillating, 1-5=fixed positions
-        state = self._get_device_state()
-        current_vswing_position = state.get("vertical_swing", 1) if state else 1
-        
+        # vswing: 0=oscillating, 1=fixed position
         control_data = {}
         if swing_mode == "off":
-            # Keep current vertical position (1-5), turn off horizontal
-            vswing_value = current_vswing_position if current_vswing_position >= 1 else 1
-            control_data = {"hswing": 1, "vswing": vswing_value}
+            control_data = {"hswing": 1, "vswing": 1}
         elif swing_mode == "horizontal":
-            # Horizontal on, keep current vertical position
-            vswing_value = current_vswing_position if current_vswing_position >= 1 else 1
-            control_data = {"hswing": 0, "vswing": vswing_value}
+            control_data = {"hswing": 0, "vswing": 1}
         elif swing_mode == "vertical":
-            # Vertical oscillating (0), horizontal off
             control_data = {"hswing": 1, "vswing": 0}
         elif swing_mode == "both":
-            # Both oscillating
             control_data = {"hswing": 0, "vswing": 0}
         
         if control_data:
             await self.coordinator.control_device(self._device_id, control_data)
-        self.async_write_ha_state()
-
-    async def async_set_swing_vertical_mode(self, swing_vertical_mode: str) -> None:
-        """Set vertical swing position (1-5)."""
-        vswing_value = VSWING_POSITION_TO_VALUE.get(swing_vertical_mode, 1)
-        await self.coordinator.control_device(self._device_id, {"vswing": vswing_value})
         self.async_write_ha_state()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
