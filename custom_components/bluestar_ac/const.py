@@ -11,7 +11,7 @@ MIN_TEMP = 16
 MAX_TEMP = 30
 
 # Fan modes
-FAN_MODES = ["auto", "low", "medium", "high"]
+FAN_MODES = ["auto", "low", "medium", "high", "turbo"]
 
 # API Configuration
 DEFAULT_BASE_URL = "https://n3on22cp53.execute-api.ap-south-1.amazonaws.com/prod"

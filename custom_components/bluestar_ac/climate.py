@@ -23,23 +23,42 @@ from .coordinator import BluestarDataUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 HVAC_MODE_TO_BLUESTAR = {
-    HVACMode.AUTO: 0,
+    HVACMode.AUTO: 4,
     HVACMode.COOL: 2,
     HVACMode.DRY: 3,
-    HVACMode.FAN_ONLY: 4,
+    HVACMode.FAN_ONLY: 0,
 }
 
 BLUESTAR_TO_HVAC_MODE = {v: k for k, v in HVAC_MODE_TO_BLUESTAR.items()}
 
-FAN_MODE_TO_BLUESTAR = {"auto": 0, "low": 2, "medium": 3, "high": 5}
+FAN_MODE_TO_BLUESTAR = {"auto": 7, "low": 2, "medium": 3, "high": 4, "turbo": 6}
 BLUESTAR_TO_FAN_MODE = {v: k for k, v in FAN_MODE_TO_BLUESTAR.items()}
 
 DEFAULT_MODE_SETTINGS = {
-    HVACMode.AUTO: {"fan_speed": 0, "temperature": 24.0},
-    HVACMode.COOL: {"fan_speed": 3, "temperature": 24.0},
-    HVACMode.DRY: {"fan_speed": 2, "temperature": 24.0},
-    HVACMode.FAN_ONLY: {"fan_speed": 3, "temperature": 24.0},
+    HVACMode.AUTO: {"fan_speed": 7, "temperature": 24.0},  # high fan
+    HVACMode.COOL: {"fan_speed": 7, "temperature": 24.0},  # auto fan
+    HVACMode.DRY: {"fan_speed": 7, "temperature": 24.0},   # high fan
+    HVACMode.FAN_ONLY: {"fan_speed": 2, "temperature": 24.0},  # low fan (auto not allowed)
 }
+
+# Modes that allow fan speed changes
+FAN_SPEED_ALLOWED_MODES = {HVACMode.COOL, HVACMode.FAN_ONLY}
+# Modes that allow temperature changes
+TEMP_ALLOWED_MODES = {HVACMode.AUTO, HVACMode.COOL, HVACMode.DRY}
+# Fan modes available in FAN_ONLY mode (no auto)
+FAN_ONLY_FAN_MODES = ["low", "medium", "high", "turbo"]
+
+# Swing modes (combined horizontal + vertical oscillation)
+SWING_MODES = ["off", "vertical", "horizontal", "both"]
+
+# Vertical swing positions (when not oscillating)
+# vswing=0 means oscillating, vswing=1-5 are fixed positions
+VERTICAL_SWING_POSITIONS = ["position_1", "position_2", "position_3", "position_4", "position_5"]
+VSWING_POSITION_TO_VALUE = {"position_1": 1, "position_2": 2, "position_3": 3, "position_4": 4, "position_5": 5}
+VSWING_VALUE_TO_POSITION = {v: k for k, v in VSWING_POSITION_TO_VALUE.items()}
+
+# Preset modes
+PRESET_MODES = ["none", "eco", "turbo", "sleep"]
 
 
 async def async_setup_entry(
@@ -66,13 +85,8 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
     _attr_min_temp = MIN_TEMP
     _attr_max_temp = MAX_TEMP
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.AUTO, HVACMode.COOL, HVACMode.DRY, HVACMode.FAN_ONLY]
-    _attr_fan_modes = FAN_MODES
-    _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
-    )
+    _attr_swing_modes = SWING_MODES
+    _attr_preset_modes = PRESET_MODES
 
     def __init__(
         self,
@@ -102,6 +116,10 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         self._local_fan_speed: int | None = None
         self._local_temperature: float | None = None
         self._last_active_mode: HVACMode = HVACMode.COOL
+        
+        # For preset mode restoration
+        self._previous_temperature: float | None = None
+        self._previous_fan_mode: int | None = None
 
     async def async_added_to_hass(self) -> None:
         """Handle entity added to hass."""
@@ -169,6 +187,33 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         return device.get("state", {}).get("connected", False)
 
     @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Return supported features based on current mode."""
+        features = (
+            ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.SWING_MODE
+            | ClimateEntityFeature.PRESET_MODE
+        )
+        current_mode = self.hvac_mode
+        if current_mode in TEMP_ALLOWED_MODES:
+            features |= ClimateEntityFeature.TARGET_TEMPERATURE
+        if current_mode in FAN_SPEED_ALLOWED_MODES:
+            features |= ClimateEntityFeature.FAN_MODE
+        # Show vertical swing position dropdown when swing is off or horizontal only
+        current_swing = self.swing_mode
+        if current_swing in ["off", "horizontal"]:
+            features |= ClimateEntityFeature.SWING_VERTICAL
+        return features
+
+    @property
+    def fan_modes(self) -> list[str]:
+        """Return available fan modes based on current HVAC mode."""
+        if self.hvac_mode == HVACMode.FAN_ONLY:
+            return FAN_ONLY_FAN_MODES
+        return FAN_MODES
+
+    @property
     def hvac_mode(self) -> HVACMode:
         """Return current HVAC mode."""
         state = self._get_device_state()
@@ -215,6 +260,69 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         self._local_fan_speed = fan_speed
         return BLUESTAR_TO_FAN_MODE.get(fan_speed, "medium")
 
+    @property
+    def swing_mode(self) -> str | None:
+        """Return current swing mode (combined horizontal + vertical oscillation)."""
+        state = self._get_device_state()
+        if not state:
+            return "off"
+        
+        # hswing: 0=oscillating, 1=off
+        # vswing: 0=oscillating, 1-5=fixed positions
+        hswing = state.get("horizontal_swing", 1)
+        vswing = state.get("vertical_swing", 1)
+        hswing_on = hswing == 0
+        vswing_on = vswing == 0  # Only 0 means oscillating
+        
+        if hswing_on and vswing_on:
+            return "both"
+        elif hswing_on:
+            return "horizontal"
+        elif vswing_on:
+            return "vertical"
+        return "off"
+
+    @property
+    def swing_vertical_mode(self) -> str | None:
+        """Return current vertical swing position (when not oscillating)."""
+        state = self._get_device_state()
+        if not state:
+            return "position_1"
+        
+        vswing = state.get("vertical_swing", 1)
+        # vswing=0 means oscillating, vswing=1-5 are positions
+        if vswing == 0:
+            return None  # Oscillating, no fixed position
+        return VSWING_VALUE_TO_POSITION.get(vswing, "position_1")
+
+    @property
+    def swing_vertical_modes(self) -> list[str] | None:
+        """Return available vertical swing positions."""
+        # Only show positions when vertical swing is not oscillating
+        current_swing = self.swing_mode
+        if current_swing in ["off", "horizontal"]:
+            return VERTICAL_SWING_POSITIONS
+        return None
+
+    @property
+    def preset_mode(self) -> str | None:
+        """Return current preset mode."""
+        state = self._get_device_state()
+        if not state:
+            return "none"
+        
+        turbo = state.get("turbo", 0)
+        esave = state.get("esave", 0)
+        sleep = state.get("sleep", 0)
+        
+        if turbo == 3:
+            return "turbo"
+        elif esave == 1:
+            return "eco"
+        elif sleep == 1:
+            return "sleep"
+        return "none"
+
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
         if hvac_mode == HVACMode.OFF:
@@ -229,6 +337,10 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
             settings = self._get_mode_settings(hvac_mode)
             fan_speed = settings.get("fan_speed", self._local_fan_speed or 3)
             temperature = settings.get("temperature", self._local_temperature or 24.0)
+            
+            # Ensure fan mode doesn't use auto fan speed
+            if hvac_mode == HVACMode.FAN_ONLY and fan_speed == 7:
+                fan_speed = 2  # default to low
             
             mode_data = {
                 "pow": 1,
@@ -267,10 +379,14 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
         if temperature is None:
             return
         
+        current_mode = self.hvac_mode
+        if current_mode not in TEMP_ALLOWED_MODES:
+            _LOGGER.warning("Temperature change not allowed in %s mode", current_mode)
+            return
+        
         await self.coordinator.set_temperature(self._device_id, temperature)
         self._local_temperature = float(temperature)
         
-        current_mode = self.hvac_mode
         if current_mode != HVACMode.OFF:
             if current_mode.value not in self._mode_settings:
                 self._mode_settings[current_mode.value] = {}
@@ -280,17 +396,99 @@ class BluestarClimateEntity(CoordinatorEntity, ClimateEntity, RestoreEntity):
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set fan mode."""
+        current_mode = self.hvac_mode
+        if current_mode not in FAN_SPEED_ALLOWED_MODES:
+            _LOGGER.warning("Fan speed change not allowed in %s mode", current_mode)
+            return
+        
+        if current_mode == HVACMode.FAN_ONLY and fan_mode == "auto":
+            _LOGGER.warning("Auto fan speed not allowed in fan mode")
+            return
+        
         bluestar_fan = FAN_MODE_TO_BLUESTAR.get(fan_mode, 3)
         await self.coordinator.set_fan_mode(self._device_id, bluestar_fan)
         
         self._local_fan_speed = bluestar_fan
         
-        current_mode = self.hvac_mode
         if current_mode != HVACMode.OFF:
             if current_mode.value not in self._mode_settings:
                 self._mode_settings[current_mode.value] = {}
             self._mode_settings[current_mode.value]["fan_speed"] = bluestar_fan
         
+        self.async_write_ha_state()
+
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
+        """Set swing mode (combined horizontal + vertical oscillation)."""
+        # hswing: 0=oscillating, 1=off
+        # vswing: 0=oscillating, 1-5=fixed positions
+        state = self._get_device_state()
+        current_vswing_position = state.get("vertical_swing", 1) if state else 1
+        
+        control_data = {}
+        if swing_mode == "off":
+            # Keep current vertical position (1-5), turn off horizontal
+            vswing_value = current_vswing_position if current_vswing_position >= 1 else 1
+            control_data = {"hswing": 1, "vswing": vswing_value}
+        elif swing_mode == "horizontal":
+            # Horizontal on, keep current vertical position
+            vswing_value = current_vswing_position if current_vswing_position >= 1 else 1
+            control_data = {"hswing": 0, "vswing": vswing_value}
+        elif swing_mode == "vertical":
+            # Vertical oscillating (0), horizontal off
+            control_data = {"hswing": 1, "vswing": 0}
+        elif swing_mode == "both":
+            # Both oscillating
+            control_data = {"hswing": 0, "vswing": 0}
+        
+        if control_data:
+            await self.coordinator.control_device(self._device_id, control_data)
+        self.async_write_ha_state()
+
+    async def async_set_swing_vertical_mode(self, swing_vertical_mode: str) -> None:
+        """Set vertical swing position (1-5)."""
+        vswing_value = VSWING_POSITION_TO_VALUE.get(swing_vertical_mode, 1)
+        await self.coordinator.control_device(self._device_id, {"vswing": vswing_value})
+        self.async_write_ha_state()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set preset mode."""
+        control_data = {
+            "esave": 0,
+            "turbo": 0,
+            "sleep": 0,
+        }
+        
+        current_preset = self.preset_mode
+        
+        # Store current settings when entering eco/turbo mode
+        if preset_mode in ["eco", "turbo"]:
+            if current_preset == "none" or current_preset is None:
+                state = self._get_device_state()
+                if state:
+                    current_temp = state.get("temperature")
+                    if current_temp:
+                        try:
+                            self._previous_temperature = float(current_temp)
+                        except (ValueError, TypeError):
+                            pass
+                    self._previous_fan_mode = state.get("fan_speed", 7)
+        
+        if preset_mode == "eco":
+            control_data["esave"] = 1
+        elif preset_mode == "turbo":
+            control_data["turbo"] = 3
+        elif preset_mode == "sleep":
+            control_data["sleep"] = 1
+        elif preset_mode == "none":
+            # Restore previous settings when exiting preset mode
+            if self._previous_temperature is not None:
+                control_data["stemp"] = f"{self._previous_temperature:.1f}"
+                self._previous_temperature = None
+            if self._previous_fan_mode is not None:
+                control_data["fspd"] = self._previous_fan_mode
+                self._previous_fan_mode = None
+        
+        await self.coordinator.control_device(self._device_id, control_data)
         self.async_write_ha_state()
 
     def _save_current_mode_settings(self, hvac_mode: HVACMode) -> None:
