@@ -201,6 +201,7 @@ class BluestarMQTTClient:
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
             self.client.on_message = self._on_message
+            self.client.on_subscribe = self._on_subscribe
             
             await loop.run_in_executor(None, self.client.connect, host, port, 60)
             self.client.loop_start()
@@ -241,6 +242,9 @@ class BluestarMQTTClient:
         self.is_connected = False
         if rc != 0 and was_connected and not self._reconnecting:
             self._schedule_reconnect()
+    
+    def _on_subscribe(self, client, userdata, mid, granted_qos):
+        _LOGGER.warning(f"MQTT subscription confirmed: mid={mid}, qos={granted_qos}")
     
     def _on_message(self, client, userdata, msg):
         _LOGGER.warning(f"_on_message called! Topic: {msg.topic}")
@@ -511,8 +515,8 @@ class BluestarAPI:
             return
         for device_id in device_ids:
             await self.mqtt_client.subscribe_to_device(device_id)
-        # Small delay to let subscriptions propagate
-        await asyncio.sleep(0.2)
+        # Wait for subscriptions to be confirmed by broker
+        await asyncio.sleep(1.0)
     
     async def request_device_states(self, device_ids: List[str]) -> None:
         if not self.mqtt_client or not await self.mqtt_client.ensure_connected():
